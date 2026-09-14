@@ -32,7 +32,8 @@ impl Store {
                  id TEXT PRIMARY KEY, agent TEXT NOT NULL, title TEXT NOT NULL,
                  project TEXT NOT NULL, cwd TEXT NOT NULL, status TEXT NOT NULL,
                  started_at INTEGER NOT NULL, elapsed_ms INTEGER NOT NULL,
-                 tokens INTEGER NOT NULL, allowed_tools TEXT NOT NULL);
+                 tokens INTEGER NOT NULL, allowed_tools TEXT NOT NULL,
+                 pending TEXT);
              CREATE TABLE IF NOT EXISTS settings (
                  key TEXT PRIMARY KEY, value TEXT NOT NULL);
              DELETE FROM sessions;",
@@ -45,11 +46,12 @@ impl Store {
     pub fn upsert_session(&self, s: &UiSession) -> rusqlite::Result<()> {
         self.conn.lock().unwrap().execute(
             "INSERT INTO sessions (id, agent, title, project, cwd, status, started_at,
-                                   elapsed_ms, tokens, allowed_tools)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                                   elapsed_ms, tokens, allowed_tools, pending)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
              ON CONFLICT(id) DO UPDATE SET
                  agent=?2, title=?3, project=?4, cwd=?5, status=?6,
-                 started_at=?7, elapsed_ms=?8, tokens=?9, allowed_tools=?10",
+                 started_at=?7, elapsed_ms=?8, tokens=?9, allowed_tools=?10,
+                 pending=?11",
             params![
                 s.session.id,
                 s.session.agent,
@@ -64,6 +66,9 @@ impl Store {
                 s.session.elapsed_ms as i64,
                 s.session.tokens as i64,
                 serde_json::to_string(&s.session.allowed_tools).unwrap_or_else(|_| "[]".into()),
+                s.pending
+                    .as_ref()
+                    .map(|p| serde_json::to_string(p).unwrap_or_default()),
             ],
         )?;
         Ok(())

@@ -98,6 +98,7 @@ const state = {
   detailReturnScroll: 0,
   openRunId: null as string | null,
   muted: false,
+  hooksInstalled: false,
   flashId: null as string | null,
   agentFilter: 'all',
 };
@@ -308,6 +309,13 @@ function htmlPermCard(s: LocalSession): string {
 
 function htmlInputCard(s: LocalSession): string {
   const q = (s.pending ?? { question: '', suggestions: [] }) as PendingInput;
+  // Claude Code idle nudges: the terminal owns the conversation (decision 2)
+  if (s.agent === 'cc') {
+    return '<article class="card attention" data-sid="' + s.id + '">' + cardHead(s, 'tag-blue', 'Waiting') +
+      '<p class="c-reason">' + esc(q.question) + '</p>' +
+      '<footer class="actions od-row"><span class="f-label">Answer in the terminal; this card clears itself when the conversation moves.</span></footer>' +
+      '</article>';
+  }
   let footer: string;
   if (s.ui === 'deny') {
     footer = '<div class="composer">' +
@@ -713,6 +721,22 @@ document.querySelector('.tabs')!.addEventListener('keydown', (e) => {
   $('#tab-' + next).focus();
 });
 
+/* ---------- claude code hooks ---------- */
+
+function syncHooksBtn(): void {
+  const btn = $('#hooksBtn');
+  btn.setAttribute('aria-pressed', state.hooksInstalled ? 'true' : 'false');
+  btn.setAttribute('aria-label', state.hooksInstalled ? 'Disconnect Claude Code hooks' : 'Connect Claude Code hooks');
+  btn.querySelector('use')!.setAttribute('href', state.hooksInstalled ? '#i-plug' : '#i-plug-off');
+}
+
+$('#hooksBtn').addEventListener('click', () => {
+  const next = !state.hooksInstalled;
+  invoke<boolean>('set_hooks', { enabled: next })
+    .then((on) => { state.hooksInstalled = on; syncHooksBtn(); })
+    .catch((e) => console.error('set_hooks failed', e));
+});
+
 /* ---------- mute ---------- */
 
 function syncMuteBtn(): void {
@@ -764,6 +788,7 @@ async function boot(): Promise<void> {
   state.runs = snap.runs;
   state.muted = snap.muted;
   syncMuteBtn();
+  invoke<boolean>('hooks_status').then((on) => { state.hooksInstalled = on; syncHooksBtn(); }).catch(() => {});
   render();
 }
 

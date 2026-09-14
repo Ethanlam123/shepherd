@@ -85,6 +85,15 @@ pub fn run() {
                 .expect("apply vibrancy");
 
             let config = ShepherdConfig::default();
+            // shepherd-hook lives next to the app binary (bundle or target dir)
+            let hook_bin = std::env::var("SHEPHERD_HOOK_BIN")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| {
+                    std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.parent().map(|d| d.join("shepherd-hook")))
+                        .unwrap_or_else(|| std::path::PathBuf::from("shepherd-hook"))
+                });
             let store = Arc::new(Store::open(&config.db_path).expect("open shepherd db"));
             let registry = Arc::new(shepherd_core::registry::Registry::new(Arc::new(AppSink {
                 app: app.handle().clone(),
@@ -98,7 +107,7 @@ pub fn run() {
             // real Claude Code sessions always; mock demo agents on demand
             // (SHEPHERD_MOCK=1 npm run dev) so mock runs never pollute the db
             let mut adapters: Vec<Box<dyn AgentAdapter>> =
-                vec![Box::new(cc::CcAdapter::new(config))];
+                vec![Box::new(cc::CcAdapter::new(config.clone()))];
             if std::env::var("SHEPHERD_MOCK").ok().as_deref() == Some("1") {
                 adapters.extend(mock::adapters());
             }
@@ -125,6 +134,8 @@ pub fn run() {
             app.manage(ipc::Ipc {
                 registry: registry.clone(),
                 store,
+                config,
+                hook_bin,
             });
             Ok(())
         })
@@ -143,6 +154,8 @@ pub fn run() {
             ipc::get_state,
             ipc::send_control,
             ipc::set_muted,
+            ipc::hooks_status,
+            ipc::set_hooks,
             ipc::hide_panel
         ])
         .run(tauri::generate_context!())
