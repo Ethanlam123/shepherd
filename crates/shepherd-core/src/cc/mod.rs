@@ -1,21 +1,29 @@
-//! Claude Code adapter: discovers live sessions from `~/.claude/sessions`
-//! and streams their transcripts as agent events. M2 scope is read-only:
-//! no permission cards (M3 hooks) and pause/stop stay unsupported (decision
-//! 1: terminal sessions cannot be driven from outside).
+//! Claude Code adapter: discovers live sessions from `~/.claude/sessions`,
+//! streams their transcripts as agent events, and serves the hook socket
+//! (M3): PreToolUse permission cards round-trip to shepherd-hook, idle
+//! notifications become nudge cards (no answer injection, decision 2), and
+//! pause/stop stay unsupported (decision 1).
 
 pub mod discover;
 pub mod install;
+pub mod server;
 pub mod transcript;
 
 pub use discover::CcSessionInfo;
 
 use crate::config::ShepherdConfig;
-use crate::{now_ms, AdapterContext, AgentAdapter, AgentEvent, Control, Envelope, Session, Status};
-use std::collections::HashMap;
+use crate::{
+    now_ms, AdapterContext, AgentAdapter, AgentEvent, Control, Envelope, PendingInput,
+    PendingPermission, Session, Status,
+};
+use serde_json::Value;
+use server::{decision_value, HookIn};
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
 use tokio::time::{interval, Duration};
 use transcript::{parse_line, Line};
 
@@ -54,6 +62,10 @@ struct Tracked {
     context_tokens: u64,
     output_total: u64,
     files: Vec<String>,
+    /// Tools approved with always-allow for this session (hook-side).
+    allowed: HashSet<String>,
+    /// Live nudge card id, cleared when transcript activity resumes.
+    nudge: Option<String>,
     /// Last title pushed to the registry; a change re-emits the session.
     pushed_title: String,
 }
@@ -75,6 +87,8 @@ impl Tracked {
             context_tokens: 0,
             output_total: 0,
             files: Vec::new(),
+            allowed: HashSet::new(),
+            nudge: None,
             pushed_title: String::new(),
             info,
         }
@@ -112,7 +126,11 @@ impl Tracked {
             started_at: self.info.started_at,
             elapsed_ms: self.elapsed_ms(),
             tokens: self.tokens(),
-            allowed_tools: Vec::new(),
+            allowed_tools: {
+                let mut v: Vec<String> = self.allowed.iter().cloned().collect();
+                v.sort();
+                v
+            },
         }
     }
 
@@ -161,6 +179,28 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 type Shared = Arc<Mutex<HashMap<String, Tracked>>>;
 
+/// One live permission card waiting on a hook connection.
+struct HookPending {
+    id: String,
+    tool: String,
+    reply: Option<oneshot::Sender<Value>>,
+    deadline_ms: i64,
+}
+
+/// The pending id a control targets; None for movement controls.
+fn pending_id_of(control: &Control) -> Option<String> {
+    match control {
+        Control::Approve { pending_id }
+        | Control::ApproveAlways { pending_id, .. }
+        | Control::ApproveEdited { pending_id, .. }
+        | Control::Deny { pending_id, .. }
+        | Control::Answer { pending_id, .. } => Some(pending_id.clone()),
+        _ => None,
+    }
+}
+
+type Pendings = HashMap<String, HookPending>;
+
 impl AgentAdapter for CcAdapter {
     fn id(&self) -> &'static str {
         "cc"
@@ -180,19 +220,35 @@ impl AgentAdapter for CcAdapter {
         let state: Shared = Arc::new(Mutex::new(HashMap::new()));
 
         spawn(Box::pin(async move {
+            // hook socket: bind inside the runtime; a failed bind (another
+            // Shepherd owns the socket) just means no permission cards
+            let (hook_tx, mut hook_rx) = tokio::sync::mpsc::unbounded_channel::<HookIn>();
+            match server::bind(&config.socket_path) {
+                Ok(listener) => {
+                    tokio::spawn(server::serve(listener, hook_tx));
+                }
+                Err(e) => eprintln!("shepherd: hook socket unavailable: {e}"),
+            }
+
             let mut tick = interval(Duration::from_secs(1));
             let mut ticks: u64 = 0;
+            let mut pendings: Pendings = HashMap::new();
+            let mut seq: u64 = 0;
             loop {
                 tokio::select! {
                     _ = tick.tick() => {
                         ticks += 1;
                         if ticks == 1 || ticks.is_multiple_of(RESCAN_TICKS) {
-                            rescan(&config, &events, &state);
+                            rescan(&config, &events, &state, &mut pendings);
                         }
                         stream(&events, &state, ticks);
+                        sweep_timeouts(&events, &mut pendings);
                     }
                     Some((sid, control)) = controls.recv() => {
-                        not_supported(&events, &sid, control);
+                        apply_control(&events, &state, &mut pendings, &sid, control);
+                    }
+                    Some(msg) = hook_rx.recv() => {
+                        handle_hook_in(&config, &events, &state, &mut pendings, &mut seq, msg);
                     }
                     else => break,
                 }
@@ -201,10 +257,279 @@ impl AgentAdapter for CcAdapter {
     }
 }
 
+/// A card that expired: reply timeout to the hook (it is likely already
+/// gone), mark the card auto-proceeded, and resume Running.
+fn sweep_timeouts(events: &UnboundedSender<Envelope>, pendings: &mut Pendings) {
+    let now = now_ms();
+    let expired: Vec<String> = pendings
+        .iter()
+        .filter(|(_, p)| p.deadline_ms <= now)
+        .map(|(sid, _)| sid.clone())
+        .collect();
+    for sid in expired {
+        if let Some(p) = pendings.remove(&sid) {
+            send_reply(p.reply, decision_value("timeout"));
+            send_activity(
+                events,
+                &sid,
+                "warn",
+                format!("! {} auto-proceeded after timeout", p.tool),
+            );
+            let _ = events.send(Envelope {
+                agent: "cc",
+                session_id: sid,
+                event: AgentEvent::PendingCleared { pending_id: p.id },
+            });
+        }
+    }
+}
+
+/// Deliver a decision to the waiting hook; a failed send means the hook
+/// process died while the user was deciding - nothing to do.
+fn send_reply(reply: Option<oneshot::Sender<Value>>, decision: Value) {
+    if let Some(tx) = reply {
+        let _ = tx.send(decision);
+    }
+}
+
+fn handle_hook_in(
+    config: &ShepherdConfig,
+    events: &UnboundedSender<Envelope>,
+    state: &Shared,
+    pendings: &mut Pendings,
+    seq: &mut u64,
+    msg: HookIn,
+) {
+    match msg {
+        HookIn::Permission {
+            session_id,
+            tool,
+            input,
+            reply,
+        } => {
+            let tracked = state.lock().unwrap().contains_key(&session_id);
+            if !tracked {
+                // unknown session (shepherd restarted mid-flight): fail open
+                send_reply(Some(reply), decision_value("pass"));
+                return;
+            }
+            let always = state
+                .lock()
+                .unwrap()
+                .get(&session_id)
+                .is_some_and(|t| t.allowed.contains(&tool));
+            if always {
+                send_activity(
+                    events,
+                    &session_id,
+                    "sys",
+                    format!("Auto-approved {tool} (always allowed this session)"),
+                );
+                send_reply(Some(reply), decision_value("approve_always"));
+                return;
+            }
+            if pendings.contains_key(&session_id) {
+                // one card at a time; Claude Code serializes per session, so
+                // this only happens on races - let the terminal handle it
+                send_reply(Some(reply), decision_value("pass"));
+                return;
+            }
+            clear_nudge(events, state, &session_id);
+            *seq += 1;
+            let id = format!("hp{seq}");
+            let deadline = now_ms() + (config.hook_timeout_secs as i64) * 1000;
+            let (command, reason) = card_fields(&tool, &input);
+            let _ = events.send(Envelope {
+                agent: "cc",
+                session_id: session_id.clone(),
+                event: AgentEvent::PermissionRequested {
+                    pending: PendingPermission {
+                        id: id.clone(),
+                        tool: tool.clone(),
+                        command,
+                        reason,
+                    },
+                },
+            });
+            pendings.insert(
+                session_id,
+                HookPending {
+                    id,
+                    tool,
+                    reply: Some(reply),
+                    deadline_ms: deadline,
+                },
+            );
+        }
+        HookIn::Notification {
+            session_id,
+            message,
+        } => {
+            let mut st = state.lock().unwrap();
+            let Some(t) = st.get_mut(&session_id) else {
+                return;
+            };
+            if t.nudge.is_some() || pendings.contains_key(&session_id) {
+                return;
+            }
+            *seq += 1;
+            let id = format!("hn{seq}");
+            t.nudge = Some(id.clone());
+            let _ = events.send(Envelope {
+                agent: "cc",
+                session_id,
+                event: AgentEvent::InputRequested {
+                    pending: PendingInput {
+                        id,
+                        question: message,
+                        suggestions: Vec::new(),
+                    },
+                },
+            });
+        }
+        HookIn::Dropped { session_id } => {
+            if let Some(p) = pendings.remove(&session_id) {
+                send_activity(
+                    events,
+                    &session_id,
+                    "warn",
+                    format!("! {} auto-proceeded (Claude stopped waiting)", p.tool),
+                );
+                let _ = events.send(Envelope {
+                    agent: "cc",
+                    session_id,
+                    event: AgentEvent::PendingCleared { pending_id: p.id },
+                });
+            }
+        }
+    }
+}
+
+/// Bash cards carry the raw command (edit-before-approve needs it verbatim);
+/// other tools show the same label the activity log uses.
+fn card_fields(tool: &str, input: &Value) -> (String, String) {
+    if tool == "Bash" {
+        let command = input
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let reason = input
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        (command, reason)
+    } else {
+        let l = transcript::tool_label(tool, input);
+        (l.label, String::new())
+    }
+}
+
+/// User decision from the panel: reply to the hook and log it.
+fn apply_control(
+    events: &UnboundedSender<Envelope>,
+    state: &Shared,
+    pendings: &mut Pendings,
+    sid: &str,
+    control: Control,
+) {
+    let Some(pending_id) = pending_id_of(&control) else {
+        not_supported(events, sid, control);
+        return;
+    };
+    // nudges (input cards) accept no answer: clear if the panel sends one
+    {
+        let mut st = state.lock().unwrap();
+        if st
+            .get(sid)
+            .is_some_and(|t| t.nudge.as_deref() == Some(pending_id.as_str()))
+        {
+            if let Some(t) = st.get_mut(sid) {
+                t.nudge = None;
+            }
+            send_activity(
+                events,
+                sid,
+                "sys",
+                ">> nudge dismissed; answer in the terminal".to_string(),
+            );
+            let _ = events.send(Envelope {
+                agent: "cc",
+                session_id: sid.to_string(),
+                event: AgentEvent::PendingCleared { pending_id },
+            });
+            return;
+        }
+    }
+    let Some(p) = pendings.get(sid) else { return };
+    if p.id != pending_id {
+        return; // stale decision for an already-replaced card
+    }
+    let p = pendings.remove(sid).expect("just checked");
+    let tool = p.tool.clone();
+    match control {
+        Control::Approve { .. } => {
+            send_activity(events, sid, "user", format!("OK approved {tool}"));
+            send_reply(p.reply, decision_value("approve"));
+        }
+        Control::ApproveAlways { tool, .. } => {
+            if let Some(t) = state.lock().unwrap().get_mut(sid) {
+                t.allowed.insert(tool.clone());
+            }
+            send_activity(
+                events,
+                sid,
+                "user",
+                format!("OK {tool} added to always-allow for this session"),
+            );
+            send_reply(p.reply, decision_value("approve_always"));
+        }
+        Control::ApproveEdited { command, .. } => {
+            send_activity(events, sid, "user", "OK approved (edited):".to_string());
+            send_activity(events, sid, "user", command.clone());
+            send_reply(
+                p.reply,
+                serde_json::json!({"decision": "approve_edited", "command": command}),
+            );
+        }
+        Control::Deny { note, .. } => {
+            let note = note
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| "Denied - take a different approach.".to_string());
+            send_activity(events, sid, "user", format!("X denied: {note}"));
+            send_reply(
+                p.reply,
+                serde_json::json!({"decision": "deny", "note": note}),
+            );
+        }
+        // unreachable: filtered above
+        _ => {}
+    }
+}
+
+fn clear_nudge(events: &UnboundedSender<Envelope>, state: &Shared, sid: &str) {
+    let mut st = state.lock().unwrap();
+    if let Some(t) = st.get_mut(sid) {
+        if let Some(id) = t.nudge.take() {
+            let _ = events.send(Envelope {
+                agent: "cc",
+                session_id: sid.to_string(),
+                event: AgentEvent::PendingCleared { pending_id: id },
+            });
+        }
+    }
+}
+
 /// Discover new sessions and release finished ones. A session is finished
 /// when its pid is dead or its session file vanished (Claude Code removes
 /// the file on normal exit; a crash leaves it behind with a dead pid).
-fn rescan(config: &ShepherdConfig, events: &UnboundedSender<Envelope>, state: &Shared) {
+fn rescan(
+    config: &ShepherdConfig,
+    events: &UnboundedSender<Envelope>,
+    state: &Shared,
+    pendings: &mut Pendings,
+) {
     let mut started: Vec<(Tracked, Vec<String>)> = Vec::new();
     let mut finished: Vec<Tracked> = Vec::new();
     {
@@ -227,6 +552,10 @@ fn rescan(config: &ShepherdConfig, events: &UnboundedSender<Envelope>, state: &S
             .map(|(id, _)| id.clone())
             .collect();
         for id in dead {
+            // a card for a finished session can never be answered: pass
+            if let Some(p) = pendings.remove(&id) {
+                send_reply(p.reply, decision_value("pass"));
+            }
             finished.push(st.remove(&id).expect("checked above"));
         }
     }
@@ -280,7 +609,7 @@ fn stream(events: &UnboundedSender<Envelope>, state: &Shared, ticks: u64) {
         let mut st = state.lock().unwrap();
         for (id, t) in st.iter_mut() {
             let mut activity = Vec::new();
-            tail(t, &mut activity);
+            let moved = tail(t, &mut activity);
             for line in &activity {
                 outbox.push((
                     id.clone(),
@@ -289,6 +618,19 @@ fn stream(events: &UnboundedSender<Envelope>, state: &Shared, ticks: u64) {
                         line: line.clone(),
                     },
                 ));
+            }
+            if moved {
+                // the conversation moved: the user answered in the terminal
+                if let Some(nid) = t.nudge.take() {
+                    outbox.push((
+                        id.clone(),
+                        AgentEvent::Activity {
+                            kind: "sys".to_string(),
+                            line: ">> answered in the terminal".to_string(),
+                        },
+                    ));
+                    outbox.push((id.clone(), AgentEvent::PendingCleared { pending_id: nid }));
+                }
             }
             if t.title() != t.pushed_title {
                 t.pushed_title = t.title();
@@ -345,34 +687,36 @@ fn send_activity(events: &UnboundedSender<Envelope>, sid: &str, kind: &str, line
 }
 
 /// Consume newly appended complete lines from the transcript into `activity`.
+/// Returns whether any complete line was consumed (the conversation moved).
 /// A trailing partial line (writer mid-append) is left for the next tick.
-fn tail(t: &mut Tracked, activity: &mut Vec<String>) {
+fn tail(t: &mut Tracked, activity: &mut Vec<String>) -> bool {
     let Ok(len) = std::fs::metadata(&t.transcript).map(|m| m.len()) else {
-        return;
+        return false;
     };
     if len < t.offset {
         t.offset = 0; // truncated or rotated: start over
     }
     if len == t.offset {
-        return;
+        return false;
     }
     let Ok(mut file) = std::fs::File::open(&t.transcript) else {
-        return;
+        return false;
     };
     if file.seek(SeekFrom::Start(t.offset)).is_err() {
-        return;
+        return false;
     }
     let mut buf = String::new();
     if file.read_to_string(&mut buf).is_err() {
-        return; // ponytail: partial UTF-8 at the boundary errors; retry next tick
+        return false; // ponytail: partial UTF-8 at the boundary errors; retry next tick
     }
     let Some(end) = buf.rfind('\n') else {
-        return; // no complete line yet
+        return false; // no complete line yet
     };
     for line in buf[..end].lines() {
         t.apply(line, activity);
     }
     t.offset += end as u64 + 1;
+    true
 }
 
 /// M2/M3 gap: controls cannot reach a terminal session. Answer instead of
@@ -679,5 +1023,341 @@ mod tests {
             .await,
             "title is the truncated first prompt"
         );
+    }
+
+    // ---------- M3 hook round trips (real socket, real adapter loop) ----------
+
+    use crate::Pending;
+    use std::io::Write as _;
+    use std::os::unix::net::UnixStream as StdStream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const M3_CWD: &str = "/tmp/shepherd-hooktest-m3";
+
+    /// Config + dirs + registry + adapter + one discovered session.
+    async fn hook_env(sid: &str, timeout_secs: u64) -> (ShepherdConfig, Arc<Registry>, Arc<Tap>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp = Box::leak(Box::new(tmp)); // keep dirs alive for the test
+        let mut config = ShepherdConfig {
+            socket_path: tmp.path().join("s.sock"),
+            ..ShepherdConfig::default()
+        };
+        config.hook_timeout_secs = timeout_secs;
+        config.claude_sessions_dir = tmp.path().join("sessions");
+        config.claude_projects_dir = tmp.path().join("projects");
+        let project_dir = config
+            .claude_projects_dir
+            .join(discover::encode_cwd(M3_CWD));
+        fs::create_dir_all(&config.claude_sessions_dir).unwrap();
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(project_dir.join(format!("{sid}.jsonl")), "").unwrap();
+        write_session(&config, std::process::id(), sid, M3_CWD);
+
+        let tap = Arc::new(Tap(Mutex::new(Vec::new())));
+        let registry = Arc::new(Registry::new(tap.clone() as Arc<dyn EventSink>));
+        let (ctl_tx, ctl_rx) = unbounded_channel();
+        registry.register_adapter("cc", ctl_tx);
+        let (ev_tx, mut ev_rx) = unbounded_channel();
+        let boxed: Box<dyn AgentAdapter> = Box::new(CcAdapter::new(config.clone()));
+        boxed.spawn(AdapterContext {
+            events: ev_tx,
+            controls: ctl_rx,
+            spawn: Arc::new(|f| {
+                tokio::spawn(f);
+            }),
+        });
+        let reg = registry.clone();
+        tokio::spawn(async move {
+            while let Some(env) = ev_rx.recv().await {
+                reg.handle_event(env);
+            }
+        });
+        assert!(
+            wait_for(
+                || registry
+                    .snapshot()
+                    .sessions
+                    .iter()
+                    .any(|s| s.session.id == sid),
+                10
+            )
+            .await,
+            "session discovered"
+        );
+        (config, registry, tap)
+    }
+
+    async fn hook_ask(
+        sock: std::path::PathBuf,
+        req: serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let mut s = tokio::net::UnixStream::connect(&sock).await.ok()?;
+        let mut line = req.to_string();
+        line.push('\n');
+        s.write_all(line.as_bytes()).await.ok()?;
+        let mut buf = String::new();
+        s.read_to_string(&mut buf).await.ok()?;
+        serde_json::from_str(buf.trim()).ok()
+    }
+
+    fn permission_req(sid: &str, tool: &str, command: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "permission",
+            "sessionId": sid,
+            "tool": tool,
+            "input": {"command": command, "description": "run it"},
+            "cwd": M3_CWD,
+        })
+    }
+
+    async fn wait_pending(registry: &Registry, sid: &str) -> crate::PendingPermission {
+        for _ in 0..50 {
+            if let Some(p) = registry
+                .snapshot()
+                .sessions
+                .iter()
+                .find(|s| s.session.id == sid)
+                .and_then(|s| match s.pending.as_ref() {
+                    Some(Pending::Permission(p)) => Some(p.clone()),
+                    _ => None,
+                })
+            {
+                return p.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        panic!("permission card never appeared");
+    }
+
+    fn is_running(registry: &Registry, sid: &str) -> bool {
+        registry
+            .snapshot()
+            .sessions
+            .iter()
+            .any(|s| s.session.id == sid && s.session.status == Status::Running)
+    }
+
+    #[tokio::test]
+    async fn hook_permission_round_trip_approve() {
+        let sid = "aaaaaaaa-0000-0000-0000-000000000001";
+        let (config, registry, tap) = hook_env(sid, 30).await;
+
+        let reply = tokio::spawn(hook_ask(
+            config.socket_path.clone(),
+            permission_req(sid, "Bash", "pnpm test auth/"),
+        ));
+        let p = wait_pending(&registry, sid).await;
+        assert_eq!(
+            p.command, "pnpm test auth/",
+            "raw command so edit-before-approve works"
+        );
+        assert_eq!(p.reason, "run it");
+        assert_eq!(registry.waiting_count(), 1);
+
+        registry.handle_control(sid, Control::Approve { pending_id: p.id });
+        assert_eq!(
+            reply.await.unwrap().expect("hook got a reply"),
+            serde_json::json!({"decision": "approve"})
+        );
+        assert!(
+            wait_for(|| tap.has_activity("OK approved Bash"), 5).await,
+            "approval logged"
+        );
+        assert!(wait_for(|| is_running(&registry, sid), 5).await);
+    }
+
+    #[tokio::test]
+    async fn always_allow_auto_approves_later_hook_requests() {
+        let sid = "aaaaaaaa-0000-0000-0000-000000000002";
+        let (config, registry, tap) = hook_env(sid, 30).await;
+
+        let first = tokio::spawn(hook_ask(
+            config.socket_path.clone(),
+            permission_req(sid, "Bash", "pnpm test"),
+        ));
+        let p = wait_pending(&registry, sid).await;
+        registry.handle_control(
+            sid,
+            Control::ApproveAlways {
+                pending_id: p.id,
+                tool: "Bash".to_string(),
+            },
+        );
+        assert_eq!(
+            first.await.unwrap().unwrap(),
+            serde_json::json!({"decision": "approve_always"})
+        );
+
+        // the next Bash never waits: immediate decision, no card
+        let second = tokio::spawn(hook_ask(
+            config.socket_path.clone(),
+            permission_req(sid, "Bash", "rm -rf build"),
+        ));
+        assert_eq!(
+            second.await.unwrap().unwrap(),
+            serde_json::json!({"decision": "approve_always"})
+        );
+        assert!(
+            wait_for(
+                || tap.has_activity("Auto-approved Bash (always allowed this session)"),
+                5
+            )
+            .await
+        );
+        assert_eq!(registry.waiting_count(), 0);
+        assert_eq!(
+            registry.snapshot().sessions[0].session.allowed_tools,
+            vec!["Bash".to_string()],
+            "always-allow chip visible in the panel"
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_note_and_edited_command_round_trip() {
+        let sid = "aaaaaaaa-0000-0000-0000-000000000003";
+        let (config, registry, tap) = hook_env(sid, 30).await;
+
+        let deny = tokio::spawn(hook_ask(
+            config.socket_path.clone(),
+            permission_req(sid, "Bash", "rm -rf build"),
+        ));
+        let p = wait_pending(&registry, sid).await;
+        registry.handle_control(
+            sid,
+            Control::Deny {
+                pending_id: p.id,
+                note: Some("use git clean".to_string()),
+            },
+        );
+        assert_eq!(
+            deny.await.unwrap().unwrap(),
+            serde_json::json!({"decision": "deny", "note": "use git clean"})
+        );
+        assert!(wait_for(|| tap.has_activity("X denied: use git clean"), 5).await);
+
+        let edited = tokio::spawn(hook_ask(
+            config.socket_path.clone(),
+            permission_req(sid, "Bash", "pnpm test"),
+        ));
+        let p = wait_pending(&registry, sid).await;
+        registry.handle_control(
+            sid,
+            Control::ApproveEdited {
+                pending_id: p.id,
+                command: "pnpm test --filter unit".to_string(),
+            },
+        );
+        assert_eq!(
+            edited.await.unwrap().unwrap(),
+            serde_json::json!({"decision": "approve_edited", "command": "pnpm test --filter unit"})
+        );
+        assert!(wait_for(|| tap.has_activity("OK approved (edited):"), 5).await);
+        assert!(wait_for(|| tap.has_activity("pnpm test --filter unit"), 5).await);
+    }
+
+    #[tokio::test]
+    async fn card_expires_after_hook_timeout() {
+        let sid = "aaaaaaaa-0000-0000-0000-000000000004";
+        let (config, registry, tap) = hook_env(sid, 2).await;
+
+        let reply = tokio::spawn(hook_ask(
+            config.socket_path.clone(),
+            permission_req(sid, "Bash", "pnpm test"),
+        ));
+        wait_pending(&registry, sid).await;
+        assert_eq!(registry.waiting_count(), 1);
+
+        // never act: the card expires, the hook times out, the badge clears
+        assert_eq!(
+            reply.await.unwrap().unwrap(),
+            serde_json::json!({"decision": "timeout"})
+        );
+        assert!(
+            wait_for(|| tap.has_activity("Bash auto-proceeded after timeout"), 5).await,
+            "timeout is visible in the log"
+        );
+        assert!(wait_for(|| is_running(&registry, sid), 5).await);
+        assert_eq!(registry.waiting_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn dead_hook_clears_its_card() {
+        let sid = "aaaaaaaa-0000-0000-0000-000000000005";
+        let (config, registry, tap) = hook_env(sid, 60).await;
+
+        // a hook that dies while waiting (Claude killed it at its own timeout)
+        let mut conn = StdStream::connect(&config.socket_path).unwrap();
+        let mut line = permission_req(sid, "Bash", "pnpm test").to_string();
+        line.push('\n');
+        conn.write_all(line.as_bytes()).unwrap();
+        wait_pending(&registry, sid).await;
+        drop(conn);
+
+        assert!(
+            wait_for(
+                || tap.has_activity("Bash auto-proceeded (Claude stopped waiting)"),
+                5
+            )
+            .await
+        );
+        assert!(wait_for(|| is_running(&registry, sid), 5).await);
+    }
+
+    #[tokio::test]
+    async fn idle_notification_becomes_nudge_cleared_by_terminal_activity() {
+        let sid = "aaaaaaaa-0000-0000-0000-000000000006";
+        let (config, registry, tap) = hook_env(sid, 60).await;
+
+        let mut conn = StdStream::connect(&config.socket_path).unwrap();
+        let nudge = serde_json::json!({
+            "type": "notification",
+            "sessionId": sid,
+            "message": "Claude is waiting for your input",
+        });
+        let mut line = nudge.to_string();
+        line.push('\n');
+        conn.write_all(line.as_bytes()).unwrap();
+        drop(conn);
+
+        assert!(
+            wait_for(
+                || {
+                    registry.snapshot().sessions.iter().any(|s| {
+                        s.session.id == sid
+                            && matches!(
+                                &s.pending,
+                                Some(Pending::Input(q)) if q.question
+                                    == "Claude is waiting for your input"
+                            )
+                    })
+                },
+                5
+            )
+            .await,
+            "nudge card appears"
+        );
+
+        // the user answers in the terminal: the transcript moves, card retires
+        let transcript = discover::transcript_path(&config.claude_projects_dir, M3_CWD, sid);
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        writeln!(f, "{}", assistant(r#"[{"type":"text","text":"thanks"}]"#)).unwrap();
+        assert!(
+            wait_for(
+                || {
+                    registry
+                        .snapshot()
+                        .sessions
+                        .iter()
+                        .any(|s| s.session.id == sid && s.pending.is_none())
+                },
+                10
+            )
+            .await,
+            "nudge clears when the conversation moves"
+        );
+        assert!(wait_for(|| tap.has_activity(">> answered in the terminal"), 5).await);
     }
 }

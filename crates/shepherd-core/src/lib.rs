@@ -91,6 +91,15 @@ pub enum Pending {
     Input(PendingInput),
 }
 
+impl Pending {
+    pub fn id(&self) -> &str {
+        match self {
+            Pending::Permission(p) => &p.id,
+            Pending::Input(p) => &p.id,
+        }
+    }
+}
+
 /// One activity-log line. `kind` is a display hint: tool|info|ok|warn|user|sys.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -117,6 +126,12 @@ pub enum AgentEvent {
     },
     InputRequested {
         pending: PendingInput,
+    },
+    /// A pending prompt resolved without a user decision (hook timeout, the
+    /// hook process was killed, or a nudge answered in the terminal).
+    /// Clears the card and resumes Running.
+    PendingCleared {
+        pending_id: String,
     },
     Progress {
         elapsed_ms: u64,

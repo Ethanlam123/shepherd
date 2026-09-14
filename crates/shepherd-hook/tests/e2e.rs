@@ -77,18 +77,28 @@ impl Drop for TempDir {
     }
 }
 
-/// One-shot socket server: reads the request line, lets the test inspect it,
-/// replies with `reply`.
+/// One-shot socket server: reads the request line (the hook keeps its write
+/// side open while waiting, so read until the newline, not EOF), lets the
+/// test inspect it, replies with `reply`, then closes.
 fn serve_once(sock: &Path, reply: Value) -> thread::JoinHandle<Value> {
     let listener = UnixListener::bind(sock).unwrap();
     thread::spawn(move || {
         let (mut conn, _) = listener.accept().unwrap();
-        let mut buf = String::new();
-        conn.read_to_string(&mut buf).unwrap();
-        let request: Value = serde_json::from_str(buf.trim()).unwrap_or(Value::Null);
-        let mut line = reply.to_string();
-        line.push('\n');
-        conn.write_all(line.as_bytes()).unwrap();
+        let mut byte = [0u8; 1];
+        let mut line = String::new();
+        loop {
+            match conn.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) if byte[0] == b'\n' => break,
+                Ok(_) => line.push(byte[0] as char),
+                Err(_) => break,
+            }
+        }
+        let request: Value = serde_json::from_str(line.trim()).unwrap_or(Value::Null);
+        let mut out = reply.to_string();
+        out.push('\n');
+        conn.write_all(out.as_bytes()).unwrap();
+        drop(conn);
         request
     })
 }

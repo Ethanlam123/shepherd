@@ -188,6 +188,18 @@ impl Registry {
                     badge_check(&mut inner, sink);
                 }
             }
+            AgentEvent::PendingCleared { pending_id } => {
+                if let Some(rec) = inner.sessions.get_mut(&env.session_id) {
+                    let matches_current =
+                        rec.pending.as_ref().is_some_and(|p| p.id() == pending_id);
+                    if matches_current {
+                        rec.pending = None;
+                        rec.session.status = Status::Running;
+                        emit_session(&inner, &env.session_id, sink);
+                        badge_check(&mut inner, sink);
+                    }
+                }
+            }
             AgentEvent::Progress { elapsed_ms, tokens } => {
                 if let Some(rec) = inner.sessions.get_mut(&env.session_id) {
                     rec.session.elapsed_ms = elapsed_ms;

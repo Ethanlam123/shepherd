@@ -76,8 +76,8 @@ fn parse_assistant(v: &Value) -> Line {
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
             Some("tool_use") => {
-                if let Some(tool) = parse_tool_use(block) {
-                    tools.push(tool);
+                if let Some(name) = block.get("name").and_then(Value::as_str) {
+                    tools.push(tool_label(name, block.get("input").unwrap_or(&Value::Null)));
                 }
             }
             Some("text") => {
@@ -110,9 +110,11 @@ fn parse_assistant(v: &Value) -> Line {
     }
 }
 
-fn parse_tool_use(block: &Value) -> Option<ToolUse> {
-    let name = block.get("name")?.as_str()?.to_string();
-    let input = block.get("input").cloned().unwrap_or(Value::Null);
+/// Label + file for a tool use, shared by transcript activity and hook
+/// permission cards.
+pub fn tool_label(name: &str, input: &Value) -> ToolUse {
+    let name = name.to_string();
+    let input = input.clone();
     let arg = LABEL_KEYS
         .iter()
         .find_map(|k| input.get(*k).and_then(Value::as_str));
@@ -133,7 +135,7 @@ fn parse_tool_use(block: &Value) -> Option<ToolUse> {
                 .map(String::from)
         })
         .flatten();
-    Some(ToolUse { name, label, file })
+    ToolUse { name, label, file }
 }
 
 /// Added/removed line counts for Edit-style inputs (new_string/old_string).

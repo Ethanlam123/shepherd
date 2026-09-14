@@ -289,16 +289,17 @@ fn socket_path() -> PathBuf {
         .join("Library/Application Support/Shepherd/shepherd.sock")
 }
 
-/// Send one JSON request, read one JSON reply. Any failure -> None.
+/// Send one JSON request line, read one JSON reply. Any failure -> None.
+/// The write side stays open: Shepherd watches it to learn when this
+/// process dies while waiting (Claude Code kills us at its hook timeout).
 fn exchange(sock: &std::path::Path, request: &Value) -> Option<Value> {
     let mut stream = UnixStream::connect(sock).ok()?;
     stream.set_read_timeout(Some(DECISION_TIMEOUT)).ok()?;
     let mut line = serde_json::to_string(request).ok()?;
     line.push('\n');
     stream.write_all(line.as_bytes()).ok()?;
-    stream.shutdown(std::net::Shutdown::Write).ok()?;
     let mut buf = String::new();
-    stream.read_to_string(&mut buf).ok()?;
+    stream.read_to_string(&mut buf).ok()?; // Shepherd closes after replying
     serde_json::from_str(buf.trim()).ok()
 }
 
