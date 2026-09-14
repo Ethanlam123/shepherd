@@ -237,6 +237,15 @@ function statusChip(s: LocalSession): string {
   return '<span class="chip-status st-running"><span class="dot"></span>Running</span>';
 }
 
+/** Terminal-owned sessions (cc) have no control channel: pause/stop render
+ * disabled with an explanatory title (decision 1). Mock agents exercise the
+ * full controls. */
+function ctlAttrs(s: LocalSession): string {
+  return s.agent === 'cc'
+    ? ' disabled title="This session lives in a terminal - control it there"'
+    : '';
+}
+
 /* ----- inbox ----- */
 
 function htmlInbox(): string {
@@ -371,11 +380,11 @@ function htmlSessions(): string {
         '</div>'
       : '<div class="s-ctl">' +
         (s.status === 'running'
-          ? '<button class="icon-btn" data-act="pause" data-sid="' + s.id + '" aria-label="Pause ' + esc(s.title) + '"><svg aria-hidden="true"><use href="#i-pause"/></svg></button>'
+          ? '<button class="icon-btn" data-act="pause" data-sid="' + s.id + '" aria-label="Pause ' + esc(s.title) + '"' + ctlAttrs(s) + '><svg aria-hidden="true"><use href="#i-pause"/></svg></button>'
           : (s.status === 'paused' || s.status === 'waiting'
-            ? '<button class="icon-btn" data-act="resume" data-sid="' + s.id + '" aria-label="Resume ' + esc(s.title) + '"><svg aria-hidden="true"><use href="#i-play"/></svg></button>'
+            ? '<button class="icon-btn" data-act="resume" data-sid="' + s.id + '" aria-label="Resume ' + esc(s.title) + '"' + ctlAttrs(s) + '><svg aria-hidden="true"><use href="#i-play"/></svg></button>'
             : '')) +
-        '<button class="icon-btn danger" data-act="stop" data-sid="' + s.id + '" aria-label="Stop ' + esc(s.title) + '"><svg aria-hidden="true"><use href="#i-stop"/></svg></button>' +
+        '<button class="icon-btn danger" data-act="stop" data-sid="' + s.id + '" aria-label="Stop ' + esc(s.title) + '"' + ctlAttrs(s) + '><svg aria-hidden="true"><use href="#i-stop"/></svg></button>' +
         '</div>';
 
     return '<article class="s-row" data-sid="' + s.id + '">' +
@@ -409,9 +418,9 @@ function htmlDetail(s: LocalSession): string {
       '</div>'
     : '<div class="actions od-row" style="margin-top:0">' +
       (isRunning
-        ? '<button class="btn btn-ghost" data-act="pause" data-sid="' + s.id + '"><svg aria-hidden="true"><use href="#i-pause"/></svg>Pause</button>'
-        : '<button class="btn btn-ghost" data-act="resume" data-sid="' + s.id + '"><svg aria-hidden="true"><use href="#i-play"/></svg>Resume</button>') +
-      '<button class="btn btn-danger-ghost" data-act="stop" data-sid="' + s.id + '"><svg aria-hidden="true"><use href="#i-stop"/></svg>Stop</button>' +
+        ? '<button class="btn btn-ghost" data-act="pause" data-sid="' + s.id + '"' + ctlAttrs(s) + '><svg aria-hidden="true"><use href="#i-pause"/></svg>Pause</button>'
+        : '<button class="btn btn-ghost" data-act="resume" data-sid="' + s.id + '"' + ctlAttrs(s) + '><svg aria-hidden="true"><use href="#i-play"/></svg>Resume</button>') +
+      '<button class="btn btn-danger-ghost" data-act="stop" data-sid="' + s.id + '"' + ctlAttrs(s) + '><svg aria-hidden="true"><use href="#i-stop"/></svg>Stop</button>' +
       '</div>';
 
   return '<article class="detail" data-sid="' + s.id + '">' +
