@@ -100,6 +100,12 @@ impl Registry {
         self.inner.lock().unwrap().muted = muted;
     }
 
+    /// Load persisted runs (newest first, as `Store::recent_runs` returns) at
+    /// startup, before any adapter spawns so in-memory runs stay newest-first.
+    pub fn seed_runs(&self, runs: Vec<Run>) {
+        self.inner.lock().unwrap().runs.extend(runs);
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         let inner = self.inner.lock().unwrap();
         let mut sessions: Vec<UiSession> = inner

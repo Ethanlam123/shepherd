@@ -8,6 +8,7 @@ pub mod cc;
 pub mod config;
 pub mod mock;
 pub mod registry;
+pub mod store;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
