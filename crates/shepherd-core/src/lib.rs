@@ -182,5 +182,5 @@ pub struct AdapterContext {
 pub trait AgentAdapter: Send + Sync {
     fn id(&self) -> &'static str;
     fn display_name(&self) -> &'static str;
-    fn spawn(self, ctx: AdapterContext);
+    fn spawn(self: Box<Self>, ctx: AdapterContext);
 }

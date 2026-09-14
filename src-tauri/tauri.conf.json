@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Shepherd",
+  "version": "0.1.0",
+  "identifier": "local.shepherd.panel",
+  "build": {
+    "beforeDevCommand": "npm run build:ui",
+    "beforeBuildCommand": "npm run build:ui",
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "panel",
+        "title": "Shepherd",
+        "width": 400,
+        "height": 660,
+        "decorations": false,
+        "transparent": true,
+        "resizable": false,
+        "skipTaskbar": true,
+        "visible": false,
+        "shadow": true,
+        "focus": false,
+        "alwaysOnTop": true,
+        "acceptFirstMouse": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [],
+    "icon": []
+  }
+}

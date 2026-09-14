@@ -4,6 +4,7 @@
 //! (SQLite) and the event log land here in M2.
 
 use crate::{now_ms, AgentEvent, Control, Envelope, LogLine, Pending, Run, Session, Status};
+use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,14 +33,15 @@ pub trait EventSink: Send + Sync {
 
 /// Session as the panel sees it: session fields plus the pending prompt (if
 /// waiting) and the activity tail.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct UiSession {
+    #[serde(flatten)]
     pub session: Session,
     pub pending: Option<Pending>,
     pub activity: Vec<LogLine>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
     pub sessions: Vec<UiSession>,
     pub runs: Vec<Run>,

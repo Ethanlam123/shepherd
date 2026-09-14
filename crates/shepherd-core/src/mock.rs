@@ -501,23 +501,24 @@ impl AgentAdapter for MockAdapter {
         display_name(self.agent)
     }
 
-    fn spawn(self, ctx: AdapterContext) {
+    fn spawn(self: Box<Self>, ctx: AdapterContext) {
+        let this = *self;
         let AdapterContext {
             events,
             mut controls,
         } = ctx;
-        let agent = self.agent;
+        let agent = this.agent;
         let loop_ctx = LoopCtx {
             agent,
             events: events.clone(),
             sessions: Arc::new(Mutex::new(Vec::new())),
             seq: Arc::new(AtomicU64::new(1)),
-            pool: self.pool,
+            pool: this.pool,
             pool_idx: Arc::new(AtomicU64::new(0)),
         };
         // all initial sessions start immediately (prototype seed())
         let mut rng = agent.as_bytes().iter().map(|b| *b as u64).sum::<u64>() | 1;
-        for script in &self.initial {
+        for script in &this.initial {
             loop_ctx.start_session(script, &mut rng);
         }
 

@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Panel window base capabilities",
+  "windows": ["panel"],
+  "permissions": ["core:default"]
+}
