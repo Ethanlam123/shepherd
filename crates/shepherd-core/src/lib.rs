@@ -5,6 +5,7 @@
 //! UI-visible state. Adapters never talk to the UI directly.
 
 pub mod config;
+pub mod mock;
 pub mod registry;
 
 use serde::{Deserialize, Serialize};
