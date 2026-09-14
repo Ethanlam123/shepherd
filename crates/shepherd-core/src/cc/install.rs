@@ -1,13 +1,14 @@
 //! Installer for Shepherd's hooks in the user-scope ~/.claude/settings.json.
-//! Merges (never clobbers): our entries are identified by a command
-//! containing "shepherd-hook"; everything else is preserved verbatim,
-//! including key order. The exact structure we install is documented in
-//! docs/shepherd-hooks-settings.json.
+//! Merges (never clobbers): our entries are identified by their command
+//! shape - the shepherd-hook binary with our `--sock` argument - so a user
+//! entry that merely mentions "shepherd-hook" is never touched. Everything
+//! else is preserved verbatim, including key order. The exact structure we
+//! install is documented in docs/shepherd-hooks-settings.json.
 
 use serde_json::{json, Map, Value};
 use std::path::Path;
 
-/// Marker identifying our hook entries among the user's own.
+/// Marker identifying our hook binary among the user's own commands.
 const MARKER: &str = "shepherd-hook";
 
 /// Timeout for the hook events that must never wait on a user decision
@@ -147,7 +148,8 @@ fn upsert_group(root: &mut Value, event: &str, our_group: Value) {
     groups.push(our_group);
 }
 
-/// A group is ours when any of its hook commands mentions the marker binary.
+/// A group is ours when any of its hook commands runs the shepherd-hook
+/// binary with our argument shape.
 fn is_ours(group: &Value) -> bool {
     group
         .get("hooks")
@@ -156,9 +158,34 @@ fn is_ours(group: &Value) -> bool {
             hs.iter().any(|h| {
                 h.get("command")
                     .and_then(Value::as_str)
-                    .is_some_and(|c| c.contains(MARKER))
+                    .is_some_and(command_is_ours)
             })
         })
+}
+
+/// `"<hook bin>" --sock "<socket>"`, quoting included. Any binary location
+/// counts (the dev and bundle installs live in the same settings file), but
+/// only names our sidecar uses; anything else is the user's own hook.
+fn command_is_ours(command: &str) -> bool {
+    let Some(rest) = command.strip_prefix('"') else {
+        return false;
+    };
+    let Some((bin, args)) = rest.split_once("\" ") else {
+        return false;
+    };
+    let name = Path::new(bin)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    // plain bundle name, or a triple-suffixed dev sidecar
+    let bin_is_ours = name == MARKER
+        || name
+            .strip_prefix(&format!("{MARKER}-"))
+            .is_some_and(|suffix| suffix.ends_with("-apple-darwin"));
+    bin_is_ours
+        && args
+            .strip_prefix("--sock \"")
+            .is_some_and(|sock| sock.len() >= 2 && sock.ends_with('"'))
 }
 
 fn count_ours(root: &Value) -> usize {
@@ -299,6 +326,8 @@ mod tests {
     fn uninstall_removes_only_ours() {
         let tmp = tempfile::tempdir().unwrap();
         let p = settings(&tmp);
+        // our entries were installed by a dev build (different hook bin than
+        // this one would use); the wrapper merely mentions shepherd-hook
         std::fs::write(
             &p,
             r#"{
@@ -306,33 +335,41 @@ mod tests {
   "hooks": {
     "PreToolUse": [
       {"matcher": "Bash", "hooks": [{"type": "command", "command": "guard.sh"}]},
-      {"matcher": "Bash|Edit", "hooks": [{"type": "command", "command": "shepherd-hook --sock s"}]}
+      {"matcher": "Bash|Edit", "hooks": [{"type": "command", "command": "\"/old/dev/bin/shepherd-hook\" --sock \"/old/dev/s.sock\""}]},
+      {"matcher": "Write", "hooks": [{"type": "command", "command": "/usr/local/bin/my-shepherd-hook-wrapper.sh"}]}
     ],
     "Notification": [
-      {"matcher": "idle_prompt", "hooks": [{"type": "command", "command": "shepherd-hook --sock s"}]}
+      {"matcher": "idle_prompt", "hooks": [{"type": "command", "command": "\"/old/dev/bin/shepherd-hook\" --sock \"/old/dev/s.sock\""}]}
     ],
     "Stop": [
       {"hooks": [{"type": "command", "command": "say done"}]},
-      {"hooks": [{"type": "command", "command": "shepherd-hook --sock s"}]}
+      {"hooks": [{"type": "command", "command": "\"/old/dev/bin/shepherd-hook-aarch64-apple-darwin\" --sock \"/old/dev/s.sock\""}]}
     ]
   }
 }"#,
         )
         .unwrap();
+        assert!(installed(&p));
         assert!(uninstall(&p).unwrap());
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
-        // our three entries gone, user's PreToolUse + Stop kept, empty Notification dropped
+        // our three entries gone (plain and triple-suffixed bins), the
+        // user's hooks kept, empty Notification dropped
         assert_eq!(
             v.pointer("/hooks/PreToolUse")
                 .unwrap()
                 .as_array()
                 .unwrap()
                 .len(),
-            1
+            2
         );
         assert_eq!(
             v.pointer("/hooks/PreToolUse/0/hooks/0/command").unwrap(),
             "guard.sh"
+        );
+        assert_eq!(
+            v.pointer("/hooks/PreToolUse/1/hooks/0/command").unwrap(),
+            "/usr/local/bin/my-shepherd-hook-wrapper.sh",
+            "a user entry mentioning shepherd-hook must survive"
         );
         assert!(v.pointer("/hooks/Notification").is_none());
         assert_eq!(
