@@ -3,7 +3,7 @@
 //! from disk within seconds), and settings hold the mute flag.
 
 use crate::registry::UiSession;
-use crate::{Run, Status};
+use crate::Run;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
@@ -56,7 +56,10 @@ impl Store {
                 s.session.title,
                 s.session.project,
                 s.session.cwd,
-                serde_json::to_string(&s.session.status).unwrap_or_else(|_| "\"running\"".into()),
+                serde_json::to_string(&s.session.status)
+                    .unwrap_or_else(|_| "\"running\"".into())
+                    .trim_matches('"')
+                    .to_string(),
                 s.session.started_at,
                 s.session.elapsed_ms as i64,
                 s.session.tokens as i64,
@@ -154,7 +157,7 @@ impl Store {
 mod tests {
     use super::*;
     use crate::registry::UiSession;
-    use crate::{LogLine, Session};
+    use crate::{LogLine, Session, Status};
 
     fn store() -> (tempfile::TempDir, Store) {
         let tmp = tempfile::tempdir().unwrap();
