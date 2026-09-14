@@ -5,3 +5,7 @@ src-tauri/gen/
 .claude/settings.local.json
 src-tauri/binaries/
 src-tauri/icons/android/
+src-tauri/icons/android/
+src-tauri/icons/ios/
+src-tauri/icons/Square*
+src-tauri/icons/StoreLogo.png
