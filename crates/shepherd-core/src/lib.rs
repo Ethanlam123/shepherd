@@ -4,6 +4,7 @@
 //! channel and receive `Control`s back; the registry is the only owner of
 //! UI-visible state. Adapters never talk to the UI directly.
 
+pub mod cc;
 pub mod config;
 pub mod mock;
 pub mod registry;
