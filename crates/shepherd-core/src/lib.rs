@@ -172,11 +172,19 @@ pub enum Control {
     Stop,
 }
 
+/// A boxed, sendable future the app's spawner can run.
+pub type BoxFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+/// Spawns a future onto the app's async runtime. The app injects this so the
+/// core never depends on the host runtime (and adapters never spawn onto a
+/// nonexistent reactor).
+pub type Spawner = std::sync::Arc<dyn Fn(BoxFuture) + Send + Sync>;
+
 /// Everything an adapter needs to run: where to send events, where controls
-/// arrive. Adapters are spawned once and run until the app exits.
+/// arrive, and how to spawn its loop.
 pub struct AdapterContext {
     pub events: mpsc::UnboundedSender<Envelope>,
     pub controls: mpsc::UnboundedReceiver<(String, Control)>,
+    pub spawn: Spawner,
 }
 
 pub trait AgentAdapter: Send + Sync {

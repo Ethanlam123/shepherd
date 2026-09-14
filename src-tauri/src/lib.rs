@@ -71,6 +71,9 @@ pub fn run() {
                 adapter.spawn(AdapterContext {
                     events: ev_tx,
                     controls: ctl_rx,
+                    spawn: Arc::new(|f| {
+                        tauri::async_runtime::spawn(f);
+                    }),
                 });
                 let reg = registry.clone();
                 tauri::async_runtime::spawn(async move {

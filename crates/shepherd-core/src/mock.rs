@@ -506,6 +506,7 @@ impl AgentAdapter for MockAdapter {
         let AdapterContext {
             events,
             mut controls,
+            spawn,
         } = ctx;
         let agent = this.agent;
         let loop_ctx = LoopCtx {
@@ -522,7 +523,7 @@ impl AgentAdapter for MockAdapter {
             loop_ctx.start_session(script, &mut rng);
         }
 
-        tokio::spawn(async move {
+        spawn(Box::pin(async move {
             let ctx = loop_ctx;
             let mut rng = rng;
             let mut tick = interval(Duration::from_secs(1));
@@ -560,7 +561,7 @@ impl AgentAdapter for MockAdapter {
                     else => break,
                 }
             }
-        });
+        }));
     }
 }
 
