@@ -28,24 +28,56 @@ pub struct Step {
 
 #[derive(Clone)]
 pub enum StepKind {
-    Log { kind: &'static str, text: &'static str },
-    Permission { tool: &'static str, command: &'static str, reason: &'static str },
-    Input { question: &'static str, suggestions: &'static [&'static str] },
-    Finish { outcome: &'static str, files: &'static [&'static str] },
+    Log {
+        kind: &'static str,
+        text: &'static str,
+    },
+    Permission {
+        tool: &'static str,
+        command: &'static str,
+        reason: &'static str,
+    },
+    Input {
+        question: &'static str,
+        suggestions: &'static [&'static str],
+    },
+    Finish {
+        outcome: &'static str,
+        files: &'static [&'static str],
+    },
 }
 
 /// Prototype step factories: L/P/Q/F.
 fn l(at: u64, kind: &'static str, text: &'static str) -> Step {
-    Step { at_ms: at * 1000, kind: StepKind::Log { kind, text } }
+    Step {
+        at_ms: at * 1000,
+        kind: StepKind::Log { kind, text },
+    }
 }
 fn p(at: u64, tool: &'static str, command: &'static str, reason: &'static str) -> Step {
-    Step { at_ms: at * 1000, kind: StepKind::Permission { tool, command, reason } }
+    Step {
+        at_ms: at * 1000,
+        kind: StepKind::Permission {
+            tool,
+            command,
+            reason,
+        },
+    }
 }
 fn q(at: u64, question: &'static str, suggestions: &'static [&'static str]) -> Step {
-    Step { at_ms: at * 1000, kind: StepKind::Input { question, suggestions } }
+    Step {
+        at_ms: at * 1000,
+        kind: StepKind::Input {
+            question,
+            suggestions,
+        },
+    }
 }
 fn f(at: u64, outcome: &'static str, files: &'static [&'static str]) -> Step {
-    Step { at_ms: at * 1000, kind: StepKind::Finish { outcome, files } }
+    Step {
+        at_ms: at * 1000,
+        kind: StepKind::Finish { outcome, files },
+    }
 }
 
 // ---------- scripts (ported verbatim from the prototype) ----------
@@ -280,10 +312,26 @@ pub struct MockAdapter {
 /// respawn pool so the agent mix stays stable across respawns.
 pub fn adapters() -> Vec<Box<dyn AgentAdapter>> {
     vec![
-        Box::new(MockAdapter { agent: "cc", initial: vec![script_auth(), script_flaky()], pool: vec![pool_orders()] }),
-        Box::new(MockAdapter { agent: "oc", initial: vec![script_mdx()], pool: vec![pool_tokens()] }),
-        Box::new(MockAdapter { agent: "pi", initial: vec![script_audit()], pool: vec![pool_ci()] }),
-        Box::new(MockAdapter { agent: "hm", initial: vec![script_index()], pool: vec![pool_docs()] }),
+        Box::new(MockAdapter {
+            agent: "cc",
+            initial: vec![script_auth(), script_flaky()],
+            pool: vec![pool_orders()],
+        }),
+        Box::new(MockAdapter {
+            agent: "oc",
+            initial: vec![script_mdx()],
+            pool: vec![pool_tokens()],
+        }),
+        Box::new(MockAdapter {
+            agent: "pi",
+            initial: vec![script_audit()],
+            pool: vec![pool_ci()],
+        }),
+        Box::new(MockAdapter {
+            agent: "hm",
+            initial: vec![script_index()],
+            pool: vec![pool_docs()],
+        }),
     ]
 }
 
@@ -299,7 +347,9 @@ fn display_name(agent: &str) -> &'static str {
 
 /// Tiny LCG so the mock has no rand dependency.
 fn lcg(state: &mut u64) -> u64 {
-    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     *state >> 33
 }
 
@@ -324,14 +374,29 @@ impl LoopCtx {
     }
 
     fn log(&self, session_id: &str, kind: &str, text: impl Into<String>) {
-        self.send(session_id, AgentEvent::Activity { kind: kind.to_string(), line: text.into() });
+        self.send(
+            session_id,
+            AgentEvent::Activity {
+                kind: kind.to_string(),
+                line: text.into(),
+            },
+        );
     }
 
     fn start_session(&self, script: &Script, rng: &mut u64) {
-        let id = format!("{}-{}", self.agent, self.seq.fetch_add(1, Ordering::Relaxed));
+        let id = format!(
+            "{}-{}",
+            self.agent,
+            self.seq.fetch_add(1, Ordering::Relaxed)
+        );
         let s = MockSession::new(id.clone(), script, rng);
         self.log(&id, "sys", format!("Session started - {}", s.title));
-        self.send(&id, AgentEvent::Started { session: s.to_session(self.agent) });
+        self.send(
+            &id,
+            AgentEvent::Started {
+                session: s.to_session(self.agent),
+            },
+        );
         self.sessions.lock().unwrap().push(s);
     }
 
@@ -353,10 +418,17 @@ impl LoopCtx {
                     let step = s.script.pop_front().unwrap();
                     match step.kind {
                         StepKind::Log { kind, text } => self.log(&s.id, kind, text),
-                        StepKind::Permission { tool, command, reason } => {
+                        StepKind::Permission {
+                            tool,
+                            command,
+                            reason,
+                        } => {
                             if s.allowed.contains(tool) {
-                                self.log(&s.id, "sys",
-                                    format!("Auto-approved {tool} (always allowed this session)"));
+                                self.log(
+                                    &s.id,
+                                    "sys",
+                                    format!("Auto-approved {tool} (always allowed this session)"),
+                                );
                                 continue;
                             }
                             s.status = Status::Waiting;
@@ -372,7 +444,10 @@ impl LoopCtx {
                             self.send(&s.id, AgentEvent::PermissionRequested { pending });
                             break;
                         }
-                        StepKind::Input { question, suggestions } => {
+                        StepKind::Input {
+                            question,
+                            suggestions,
+                        } => {
                             s.status = Status::Waiting;
                             self.log(&s.id, "warn", format!("! Question for you - {question}"));
                             let pending = PendingInput {
@@ -386,11 +461,14 @@ impl LoopCtx {
                         }
                         StepKind::Finish { outcome, files } => {
                             self.log(&s.id, "ok", "OK run complete");
-                            self.send(&s.id, AgentEvent::Finished {
-                                outcome: Some(outcome.to_string()),
-                                files: files.iter().map(|x| x.to_string()).collect(),
-                                stopped: false,
-                            });
+                            self.send(
+                                &s.id,
+                                AgentEvent::Finished {
+                                    outcome: Some(outcome.to_string()),
+                                    files: files.iter().map(|x| x.to_string()).collect(),
+                                    stopped: false,
+                                },
+                            );
                             finished.push(s.id.clone());
                             break;
                         }
@@ -424,7 +502,10 @@ impl AgentAdapter for MockAdapter {
     }
 
     fn spawn(self, ctx: AdapterContext) {
-        let AdapterContext { events, mut controls } = ctx;
+        let AdapterContext {
+            events,
+            mut controls,
+        } = ctx;
         let agent = self.agent;
         let loop_ctx = LoopCtx {
             agent,
@@ -459,7 +540,7 @@ impl AgentAdapter for MockAdapter {
                             }
                         }
                         ctx.process_steps(&mut rng);
-                        if ticks % 10 == 0 {
+                        if ticks.is_multiple_of(10) {
                             // periodic correction for panel-local timers
                             let sx = ctx.sessions.lock().unwrap();
                             for s in sx.iter() {
@@ -486,7 +567,9 @@ fn apply_control(ctx: &LoopCtx, sid: &str, control: Control) {
     let mut stopped = false;
     {
         let mut sx = ctx.sessions.lock().unwrap();
-        let Some(s) = sx.iter_mut().find(|s| s.id == sid) else { return };
+        let Some(s) = sx.iter_mut().find(|s| s.id == sid) else {
+            return;
+        };
         let resume = |s: &mut MockSession| {
             s.pending_tool = None;
             s.status = Status::Running;
@@ -499,7 +582,11 @@ fn apply_control(ctx: &LoopCtx, sid: &str, control: Control) {
             }
             Control::ApproveAlways { tool, .. } => {
                 s.allowed.insert(tool.clone());
-                ctx.log(sid, "user", format!("OK {tool} added to always-allow for this session"));
+                ctx.log(
+                    sid,
+                    "user",
+                    format!("OK {tool} added to always-allow for this session"),
+                );
                 resume(s);
             }
             Control::ApproveEdited { command, .. } => {
@@ -527,7 +614,11 @@ fn apply_control(ctx: &LoopCtx, sid: &str, control: Control) {
             Control::Resume => {
                 if s.status != Status::Running {
                     if s.pending_tool.is_some() {
-                        ctx.log(sid, "sys", ">> resumed by you (still waiting on the same prompt)");
+                        ctx.log(
+                            sid,
+                            "sys",
+                            ">> resumed by you (still waiting on the same prompt)",
+                        );
                     } else {
                         ctx.log(sid, "sys", ">> resumed by you");
                         s.status = Status::Running;
@@ -536,11 +627,14 @@ fn apply_control(ctx: &LoopCtx, sid: &str, control: Control) {
             }
             Control::Stop => {
                 ctx.log(sid, "sys", "Run stopped by user");
-                ctx.send(sid, AgentEvent::Finished {
-                    outcome: None,
-                    files: Vec::new(),
-                    stopped: true,
-                });
+                ctx.send(
+                    sid,
+                    AgentEvent::Finished {
+                        outcome: None,
+                        files: Vec::new(),
+                        stopped: true,
+                    },
+                );
                 stopped = true;
             }
         }
@@ -559,8 +653,15 @@ mod tests {
     #[test]
     fn scripts_are_well_formed() {
         let all = [
-            script_auth(), script_flaky(), script_mdx(), script_audit(), script_index(),
-            pool_orders(), pool_tokens(), pool_ci(), pool_docs(),
+            script_auth(),
+            script_flaky(),
+            script_mdx(),
+            script_audit(),
+            script_index(),
+            pool_orders(),
+            pool_tokens(),
+            pool_ci(),
+            pool_docs(),
         ];
         assert_eq!(all.len(), 9);
         for script in &all {
@@ -571,7 +672,10 @@ mod tests {
                 script.title
             );
             assert!(
-                matches!(script.steps.last().map(|s| &s.kind), Some(StepKind::Finish { .. })),
+                matches!(
+                    script.steps.last().map(|s| &s.kind),
+                    Some(StepKind::Finish { .. })
+                ),
                 "{}: does not end with Finish",
                 script.title
             );

@@ -82,8 +82,16 @@ impl Registry {
     }
 
     /// Control channel back to the adapter that owns an agent's sessions.
-    pub fn register_adapter(&self, agent: &str, controls: mpsc::UnboundedSender<(String, Control)>) {
-        self.inner.lock().unwrap().adapters.insert(agent.to_string(), controls);
+    pub fn register_adapter(
+        &self,
+        agent: &str,
+        controls: mpsc::UnboundedSender<(String, Control)>,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .adapters
+            .insert(agent.to_string(), controls);
     }
 
     pub fn set_muted(&self, muted: bool) {
@@ -102,7 +110,11 @@ impl Registry {
             })
             .collect();
         sessions.sort_by_key(|s| s.session.started_at);
-        Snapshot { sessions, runs: inner.runs.clone(), muted: inner.muted }
+        Snapshot {
+            sessions,
+            runs: inner.runs.clone(),
+            muted: inner.muted,
+        }
     }
 
     pub fn waiting_count(&self) -> usize {
@@ -126,19 +138,30 @@ impl Registry {
                 let id = session.id.clone();
                 inner.sessions.insert(
                     id.clone(),
-                    SessionRec { session, pending: None, activity: VecDeque::new() },
+                    SessionRec {
+                        session,
+                        pending: None,
+                        activity: VecDeque::new(),
+                    },
                 );
                 emit_session(&inner, &id, sink);
                 badge_check(&mut inner, sink);
             }
             AgentEvent::Activity { kind, line } => {
                 if let Some(rec) = inner.sessions.get_mut(&env.session_id) {
-                    let entry = LogLine { ts: now_ms(), kind, text: line };
+                    let entry = LogLine {
+                        ts: now_ms(),
+                        kind,
+                        text: line,
+                    };
                     rec.activity.push_back(entry.clone());
                     if rec.activity.len() > ACTIVITY_CAP {
                         rec.activity.pop_front();
                     }
-                    sink.emit(UiEvent::Activity { session_id: env.session_id, line: entry });
+                    sink.emit(UiEvent::Activity {
+                        session_id: env.session_id,
+                        line: entry,
+                    });
                 }
             }
             AgentEvent::PermissionRequested { pending } => {
@@ -164,12 +187,20 @@ impl Registry {
                     emit_session(&inner, &env.session_id, sink);
                 }
             }
-            AgentEvent::Finished { outcome, files, stopped } => {
+            AgentEvent::Finished {
+                outcome,
+                files,
+                stopped,
+            } => {
                 let run_id = self.next_run_id();
-                if let Some(run) = finish(&mut inner, &env.session_id, run_id, outcome, files, stopped) {
+                if let Some(run) =
+                    finish(&mut inner, &env.session_id, run_id, outcome, files, stopped)
+                {
                     sink.emit(UiEvent::Run(run));
                 }
-                sink.emit(UiEvent::Removed { session_id: env.session_id });
+                sink.emit(UiEvent::Removed {
+                    session_id: env.session_id,
+                });
                 badge_check(&mut inner, sink);
             }
             AgentEvent::Failed { message } => {
@@ -184,7 +215,9 @@ impl Registry {
                 ) {
                     sink.emit(UiEvent::Run(run));
                 }
-                sink.emit(UiEvent::Removed { session_id: env.session_id });
+                sink.emit(UiEvent::Removed {
+                    session_id: env.session_id,
+                });
                 badge_check(&mut inner, sink);
             }
         }
@@ -224,8 +257,11 @@ impl Registry {
                 Control::Resume => {
                     if rec.session.status != Status::Running {
                         // A still-pending prompt keeps the session waiting.
-                        rec.session.status =
-                            if rec.pending.is_some() { Status::Waiting } else { Status::Running };
+                        rec.session.status = if rec.pending.is_some() {
+                            Status::Waiting
+                        } else {
+                            Status::Running
+                        };
                     }
                 }
                 Control::Stop => {} // adapter emits Finished{stopped}
@@ -259,7 +295,11 @@ fn emit_session(inner: &Inner, session_id: &str, sink: &dyn EventSink) {
 
 /// Emit a Badge event only when the waiting count actually changed.
 fn badge_check(inner: &mut Inner, sink: &dyn EventSink) {
-    let count = inner.sessions.values().filter(|r| r.session.status == Status::Waiting).count();
+    let count = inner
+        .sessions
+        .values()
+        .filter(|r| r.session.status == Status::Waiting)
+        .count();
     if count != inner.last_badge {
         inner.last_badge = count;
         sink.emit(UiEvent::Badge { count });
@@ -285,7 +325,11 @@ fn finish(
         duration_ms: rec.session.elapsed_ms,
         tokens: rec.session.tokens,
         stopped,
-        outcome: if stopped { STOPPED_OUTCOME.to_string() } else { outcome.unwrap_or_default() },
+        outcome: if stopped {
+            STOPPED_OUTCOME.to_string()
+        } else {
+            outcome.unwrap_or_default()
+        },
         files: if stopped { Vec::new() } else { files },
     };
     inner.runs.insert(0, run.clone());
@@ -318,7 +362,10 @@ mod tests {
 
     fn registry() -> (Arc<Registry>, Arc<Sink>) {
         let sink = Arc::new(Sink(Mutex::new(Vec::new())));
-        (Arc::new(Registry::new(sink.clone() as Arc<dyn EventSink>)), sink)
+        (
+            Arc::new(Registry::new(sink.clone() as Arc<dyn EventSink>)),
+            sink,
+        )
     }
 
     fn session(id: &str) -> Session {
@@ -337,7 +384,11 @@ mod tests {
     }
 
     fn started(s: Session) -> Envelope {
-        Envelope { agent: "cc", session_id: s.id.clone(), event: AgentEvent::Started { session: s } }
+        Envelope {
+            agent: "cc",
+            session_id: s.id.clone(),
+            event: AgentEvent::Started { session: s },
+        }
     }
 
     fn permission(sid: &str, pid: &str) -> Envelope {
@@ -371,7 +422,12 @@ mod tests {
         // register a capture adapter so we can assert forwarding
         let (tx, mut rx) = mpsc::unbounded_channel();
         reg.register_adapter("cc", tx);
-        assert!(reg.handle_control("cc-1", Control::Approve { pending_id: "p1".to_string() }));
+        assert!(reg.handle_control(
+            "cc-1",
+            Control::Approve {
+                pending_id: "p1".to_string()
+            }
+        ));
 
         assert_eq!(reg.waiting_count(), 0);
         assert!(seen(&sink, "badge:0"));
@@ -390,14 +446,23 @@ mod tests {
         reg.handle_event(permission("cc-1", "p1"));
         reg.handle_control(
             "cc-1",
-            Control::ApproveAlways { pending_id: "p1".to_string(), tool: "Bash".to_string() },
+            Control::ApproveAlways {
+                pending_id: "p1".to_string(),
+                tool: "Bash".to_string(),
+            },
         );
         reg.handle_event(permission("cc-1", "p2"));
         reg.handle_control(
             "cc-1",
-            Control::ApproveAlways { pending_id: "p2".to_string(), tool: "Bash".to_string() },
+            Control::ApproveAlways {
+                pending_id: "p2".to_string(),
+                tool: "Bash".to_string(),
+            },
         );
-        assert_eq!(reg.snapshot().sessions[0].session.allowed_tools, vec!["Bash"]);
+        assert_eq!(
+            reg.snapshot().sessions[0].session.allowed_tools,
+            vec!["Bash"]
+        );
     }
 
     #[test]
@@ -429,7 +494,11 @@ mod tests {
         reg.handle_event(Envelope {
             agent: "cc",
             session_id: "cc-2".to_string(),
-            event: AgentEvent::Finished { outcome: None, files: vec![], stopped: true },
+            event: AgentEvent::Finished {
+                outcome: None,
+                files: vec![],
+                stopped: true,
+            },
         });
         let snap = reg.snapshot();
         assert_eq!(snap.runs[0].outcome, STOPPED_OUTCOME);
@@ -445,7 +514,10 @@ mod tests {
             reg.handle_event(Envelope {
                 agent: "cc",
                 session_id: "cc-1".to_string(),
-                event: AgentEvent::Activity { kind: "tool".to_string(), line: format!("line {i}") },
+                event: AgentEvent::Activity {
+                    kind: "tool".to_string(),
+                    line: format!("line {i}"),
+                },
             });
         }
         assert_eq!(reg.snapshot().sessions[0].activity.len(), ACTIVITY_CAP);

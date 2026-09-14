@@ -103,13 +103,31 @@ pub struct LogLine {
 /// which carries elapsed/token updates that hooks don't provide per event.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
-    Started { session: Session },
-    Activity { kind: String, line: String },
-    PermissionRequested { pending: PendingPermission },
-    InputRequested { pending: PendingInput },
-    Progress { elapsed_ms: u64, tokens: u64 },
-    Finished { outcome: Option<String>, files: Vec<String>, stopped: bool },
-    Failed { message: String },
+    Started {
+        session: Session,
+    },
+    Activity {
+        kind: String,
+        line: String,
+    },
+    PermissionRequested {
+        pending: PendingPermission,
+    },
+    InputRequested {
+        pending: PendingInput,
+    },
+    Progress {
+        elapsed_ms: u64,
+        tokens: u64,
+    },
+    Finished {
+        outcome: Option<String>,
+        files: Vec<String>,
+        stopped: bool,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 /// Adapter event tagged with its origin session.
@@ -126,15 +144,29 @@ pub struct Envelope {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Control {
     #[serde(rename_all = "camelCase")]
-    Approve { pending_id: String },
+    Approve {
+        pending_id: String,
+    },
     #[serde(rename_all = "camelCase")]
-    ApproveAlways { pending_id: String, tool: String },
+    ApproveAlways {
+        pending_id: String,
+        tool: String,
+    },
     #[serde(rename_all = "camelCase")]
-    ApproveEdited { pending_id: String, command: String },
+    ApproveEdited {
+        pending_id: String,
+        command: String,
+    },
     #[serde(rename_all = "camelCase")]
-    Deny { pending_id: String, note: Option<String> },
+    Deny {
+        pending_id: String,
+        note: Option<String>,
+    },
     #[serde(rename_all = "camelCase")]
-    Answer { pending_id: String, text: String },
+    Answer {
+        pending_id: String,
+        text: String,
+    },
     Pause,
     Resume,
     Stop,

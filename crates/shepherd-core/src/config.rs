@@ -48,7 +48,10 @@ impl Default for ShepherdConfig {
             claude_settings_path: home.join(".claude/settings.json"),
             claude_projects_dir: home.join(".claude/projects"),
             claude_sessions_dir: home.join(".claude/sessions"),
-            intercept_tools: DEFAULT_INTERCEPT_TOOLS.iter().map(|s| s.to_string()).collect(),
+            intercept_tools: DEFAULT_INTERCEPT_TOOLS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             hook_timeout_secs: HOOK_TIMEOUT_SECS,
             verified_claude_version: "2.1.3".to_string(),
         }
