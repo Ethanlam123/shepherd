@@ -1,0 +1,50 @@
+{
+  "_comment": [
+    "The exact hooks block Shepherd merges into ~/.claude/settings.json (user scope).",
+    "Paths are substituted at install time; shown here with placeholders.",
+    "Schema verified against code.claude.com/docs/en/hooks and settings-reference, Claude Code 2.1.270, 2026-09-14.",
+    "",
+    "PreToolUse:",
+    "  - matcher is a regex; covers exactly the consequential tools (decision 5).",
+    "  - runs before permission evaluation for every matching call, so the hook",
+    "    itself pass-throughs (exit 0, no output) when the user's own allow rules",
+    "    match or the session is in bypassPermissions/acceptEdits mode.",
+    "  - timeout 900s: Claude Code's hook timeout is non-blocking (the tool call",
+    "    proceeds when it fires), matching our card-expiry behavior (decision 3).",
+    "",
+    "Notification:",
+    "  - matcher idle_prompt fires only for the ~60s idle 'waiting for input'",
+    "    nudge; permission_prompt notifications are deliberately NOT intercepted",
+    "    because PreToolUse already owns permission cards.",
+    "",
+    "Merge rules: entries whose command contains 'shepherd-hook' are ours.",
+    "Install appends/refreshes them; uninstall removes exactly those entries.",
+    "All other hooks and keys are preserved verbatim (key order included)."
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|WebFetch|WebSearch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"<path-to-shepherd-hook>\" --sock \"<path-to-shepherd.sock>\"",
+            "timeout": 900
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"<path-to-shepherd-hook>\" --sock \"<path-to-shepherd.sock>\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

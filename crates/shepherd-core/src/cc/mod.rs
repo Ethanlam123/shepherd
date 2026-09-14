@@ -4,6 +4,7 @@
 //! 1: terminal sessions cannot be driven from outside).
 
 pub mod discover;
+pub mod install;
 pub mod transcript;
 
 pub use discover::CcSessionInfo;
