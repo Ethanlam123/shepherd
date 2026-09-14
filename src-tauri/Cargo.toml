@@ -19,3 +19,5 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 window-vibrancy = "0.5"
 resvg = "0.45"
 shepherd-core = { path = "../crates/shepherd-core" }
+tauri-plugin-updater = "2.11.0"
+objc2-service-management = { version = "0.3.2", features = ["SMAppService", "objc2", "objc2-foundation"] }

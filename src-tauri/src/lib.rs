@@ -2,6 +2,7 @@
 
 mod icon;
 mod ipc;
+mod login;
 mod tray;
 
 use serde::Serialize;
@@ -128,9 +129,24 @@ impl AppSink {
     }
 }
 
+/// Resolve the shepherd-hook binary: the bundle ships it plain-named next to
+/// the app binary, dev copies carry the target-triple suffix (externalBin).
+/// Falls back to a PATH lookup when neither exists.
+fn hook_bin_path(dir: Option<&std::path::Path>) -> std::path::PathBuf {
+    let triple = format!("shepherd-hook-{}-apple-darwin", std::env::consts::ARCH);
+    dir.and_then(|d| {
+        ["shepherd-hook", triple.as_str()]
+            .iter()
+            .map(|n| d.join(n))
+            .find(|p| p.exists())
+    })
+    .unwrap_or_else(|| std::path::PathBuf::from("shepherd-hook"))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // menu-bar app: no dock icon
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -140,14 +156,17 @@ pub fn run() {
                 .expect("apply vibrancy");
 
             let config = ShepherdConfig::default();
-            // shepherd-hook lives next to the app binary (bundle or target dir)
+            // shepherd-hook lives next to the app binary: plain-named in the
+            // release bundle, triple-suffixed in dev (externalBin sidecar).
             let hook_bin = std::env::var("SHEPHERD_HOOK_BIN")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| {
-                    std::env::current_exe()
-                        .ok()
-                        .and_then(|p| p.parent().map(|d| d.join("shepherd-hook")))
-                        .unwrap_or_else(|| std::path::PathBuf::from("shepherd-hook"))
+                    hook_bin_path(
+                        std::env::current_exe()
+                            .ok()
+                            .as_deref()
+                            .and_then(|p| p.parent()),
+                    )
                 });
             let store = Arc::new(Store::open(&config.db_path).expect("open shepherd db"));
             let registry = Arc::new(shepherd_core::registry::Registry::new(Arc::new(AppSink {
@@ -212,8 +231,43 @@ pub fn run() {
             ipc::set_muted,
             ipc::hooks_status,
             ipc::set_hooks,
+            ipc::login_item_enabled,
+            ipc::set_login_item,
+            ipc::check_updates,
+            ipc::install_updates,
+            ipc::relaunch,
             ipc::hide_panel
         ])
         .run(tauri::generate_context!())
         .expect("error while running shepherd");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hook_bin_path;
+
+    /// The bundle ships the hook plain-named next to the app binary; the
+    /// triple-suffixed sidecar is the dev fallback.
+    #[test]
+    fn hook_bin_prefers_plain_name_then_triple_suffix() {
+        let dir = std::env::temp_dir().join("shepherd-hook-bin-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let triple = format!("shepherd-hook-{}-apple-darwin", std::env::consts::ARCH);
+
+        std::fs::write(dir.join(&triple), b"bin").unwrap();
+        assert_eq!(hook_bin_path(Some(&dir)), dir.join(&triple));
+
+        std::fs::write(dir.join("shepherd-hook"), b"bin").unwrap();
+        assert_eq!(hook_bin_path(Some(&dir)), dir.join("shepherd-hook"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hook_bin_falls_back_to_path_lookup() {
+        assert_eq!(
+            hook_bin_path(None),
+            std::path::PathBuf::from("shepherd-hook")
+        );
+    }
 }

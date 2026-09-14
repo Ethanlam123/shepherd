@@ -1,5 +1,6 @@
 //! Tauri commands the panel calls over IPC.
 
+use serde::Serialize;
 use shepherd_core::cc::install;
 use shepherd_core::config::ShepherdConfig;
 use shepherd_core::registry::{Registry, Snapshot};
@@ -8,6 +9,7 @@ use shepherd_core::Control;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
+use tauri_plugin_updater::UpdaterExt;
 
 pub struct Ipc {
     pub registry: Arc<Registry>,
@@ -68,4 +70,63 @@ pub fn hide_panel(app: AppHandle) {
     if let Some(w) = app.get_webview_window("panel") {
         let _ = w.hide();
     }
+}
+
+/* ---------- launch at login (SMAppService) ---------- */
+
+#[tauri::command]
+pub fn login_item_enabled() -> Result<bool, String> {
+    crate::login::is_enabled()
+}
+
+#[tauri::command]
+pub fn set_login_item(enabled: bool) -> Result<(), String> {
+    crate::login::set(enabled)
+}
+
+/* ---------- updates (minisign updater) ---------- */
+
+/// Pending update as the panel shows it. `notes` is the release body.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInfo {
+    pub version: String,
+    pub notes: Option<String>,
+}
+
+/// Manual check only - no startup auto-poll while there is no release
+/// server; errors land in the panel notice line.
+#[tauri::command]
+pub async fn check_updates(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
+    let update = app
+        .updater()
+        .map_err(|e| format!("updater unavailable: {e}"))?
+        .check()
+        .await
+        .map_err(|e| format!("update check failed: {e}"))?;
+    Ok(update.map(|u| UpdateInfo {
+        version: u.version.clone(),
+        notes: u.body.clone(),
+    }))
+}
+
+#[tauri::command]
+pub async fn install_updates(app: AppHandle) -> Result<(), String> {
+    let update = app
+        .updater()
+        .map_err(|e| format!("updater unavailable: {e}"))?
+        .check()
+        .await
+        .map_err(|e| format!("update check failed: {e}"))?
+        .ok_or("no update available")?;
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|e| format!("update install failed: {e}"))
+}
+
+/// The updater swaps the app bundle; a restart is required to run it.
+#[tauri::command]
+pub fn relaunch(app: AppHandle) {
+    app.restart();
 }

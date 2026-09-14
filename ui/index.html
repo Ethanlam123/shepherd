@@ -55,6 +55,13 @@
     <symbol id="i-pen" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
       <path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/>
     </symbol>
+    <symbol id="i-power" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/>
+    </symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+      <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+    </symbol>
   </defs>
 </svg>
 
@@ -70,8 +77,15 @@
       <button id="muteBtn" class="icon-btn" type="button" aria-label="Mute notifications" aria-pressed="false">
         <svg><use href="#i-bell"/></svg>
       </button>
+      <button id="loginBtn" class="icon-btn" type="button" aria-label="Start Shepherd at login" aria-pressed="false" title="Start at login">
+        <svg><use href="#i-power"/></svg>
+      </button>
+      <button id="updateBtn" class="icon-btn" type="button" aria-label="Check for Shepherd updates" title="Check for updates">
+        <svg><use href="#i-refresh"/></svg>
+      </button>
     </div>
     <p id="summaryLine" class="summary"></p>
+    <p id="noticeLine" class="notice" hidden></p>
   </div>
   <div class="tabs" role="tablist" aria-label="Panel sections">
     <button class="tab" role="tab" id="tab-inbox" type="button" aria-selected="true">Inbox <span class="count" id="c-inbox">0</span></button>

@@ -761,6 +761,48 @@ $('#muteBtn').addEventListener('click', () => {
   invoke('set_muted', { muted: state.muted }).catch((e) => console.error('set_muted failed', e));
 });
 
+/* ---------- start at login + updates (packaging) ---------- */
+
+type UpdateInfo = { version: string; notes: string | null };
+
+/** One-line feedback surface for settings actions (login toggle, updates). */
+function notice(msg: string): void {
+  const el = $('#noticeLine');
+  el.textContent = msg;
+  el.hidden = !msg;
+}
+
+function syncLoginBtn(on: boolean): void {
+  $('#loginBtn').setAttribute('aria-pressed', on ? 'true' : 'false');
+}
+
+$('#loginBtn').addEventListener('click', () => {
+  const next = $('#loginBtn').getAttribute('aria-pressed') !== 'true';
+  invoke<void>('set_login_item', { enabled: next })
+    .then(() => {
+      syncLoginBtn(next);
+      notice(next ? 'Shepherd will start at login' : 'Starting at login is off');
+    })
+    .catch((e) => notice(String(e)));
+});
+
+$('#updateBtn').addEventListener('click', () => {
+  notice('Checking for updates...');
+  invoke<UpdateInfo | null>('check_updates')
+    .then((up) => {
+      if (!up) {
+        notice('Shepherd is up to date');
+        return;
+      }
+      if (!window.confirm('Shepherd ' + up.version + ' is available. Download and install?')) return;
+      notice('Downloading Shepherd ' + up.version + '...');
+      return invoke<void>('install_updates')
+        .then(() => { notice('Installed - relaunching'); return invoke<void>('relaunch'); })
+        .catch((e) => notice(String(e)));
+    })
+    .catch((e) => notice(String(e)));
+});
+
 /* ---------- escape: close composers, confirms, then detail - never the panel ---------- */
 
 document.addEventListener('keydown', (e) => {
@@ -798,6 +840,7 @@ async function boot(): Promise<void> {
   state.muted = snap.muted;
   syncMuteBtn();
   invoke<boolean>('hooks_status').then((on) => { state.hooksInstalled = on; syncHooksBtn(); }).catch(() => {});
+  invoke<boolean>('login_item_enabled').then(syncLoginBtn).catch(() => {});
   render();
 }
 
