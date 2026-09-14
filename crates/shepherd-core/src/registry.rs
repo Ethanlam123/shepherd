@@ -102,7 +102,15 @@ impl Registry {
 
     /// Load persisted runs (newest first, as `Store::recent_runs` returns) at
     /// startup, before any adapter spawns so in-memory runs stay newest-first.
+    /// Run ids resume past the highest persisted id: the store upserts by id,
+    /// so a fresh "r0" would REPLACE the newest persisted run.
     pub fn seed_runs(&self, runs: Vec<Run>) {
+        let max_seq = runs
+            .iter()
+            .filter_map(|r| r.id.strip_prefix('r').and_then(|s| s.parse::<u64>().ok()))
+            .max()
+            .unwrap_or(0);
+        self.run_seq.store(max_seq + 1, Ordering::Relaxed);
         self.inner.lock().unwrap().runs.extend(runs);
     }
 
@@ -608,6 +616,41 @@ mod tests {
             },
         });
         assert!(reg.snapshot().runs.is_empty());
+    }
+
+    /// Restart safety: a run recorded after seeding persisted runs must not
+    /// reuse a persisted id (the store upserts by id, so a collision would
+    /// silently overwrite the newest persisted run).
+    #[test]
+    fn seeded_run_ids_are_not_reused() {
+        let (reg, _sink) = registry();
+        let old = crate::Run {
+            id: "r0".to_string(),
+            agent: "cc".to_string(),
+            title: "old".to_string(),
+            project: "p".to_string(),
+            ended_at: 1,
+            duration_ms: 1,
+            tokens: 1,
+            stopped: false,
+            outcome: "persisted".to_string(),
+            files: vec![],
+        };
+        reg.seed_runs(vec![old]);
+        reg.handle_event(started(session("cc-1")));
+        reg.handle_event(Envelope {
+            agent: "cc",
+            session_id: "cc-1".to_string(),
+            event: AgentEvent::TurnFinished {
+                outcome: "new".to_string(),
+                files: vec![],
+            },
+        });
+        let snap = reg.snapshot();
+        assert_eq!(snap.runs.len(), 2);
+        assert_eq!(snap.runs[0].id, "r1");
+        assert_eq!(snap.runs[1].id, "r0");
+        assert_eq!(snap.runs[1].outcome, "persisted");
     }
 
     #[test]
