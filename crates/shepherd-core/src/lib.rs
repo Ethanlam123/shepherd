@@ -137,6 +137,15 @@ pub enum AgentEvent {
         elapsed_ms: u64,
         tokens: u64,
     },
+    /// A turn of a still-live session completed (Stop hook). Records a run
+    /// without ending the session: follow-up turns keep the session open.
+    TurnFinished {
+        outcome: String,
+        files: Vec<String>,
+    },
+    /// The session ended. `outcome: None` with `stopped: false` means the
+    /// final turn was already recorded (TurnFinished) - remove the session
+    /// without recording a duplicate run.
     Finished {
         outcome: Option<String>,
         files: Vec<String>,

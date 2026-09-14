@@ -2,7 +2,9 @@
 //! streams their transcripts as agent events, and serves the hook socket
 //! (M3): PreToolUse permission cards round-trip to shepherd-hook, idle
 //! notifications become nudge cards (no answer injection, decision 2), and
-//! pause/stop stay unsupported (decision 1).
+//! pause/stop stay unsupported (decision 1). The Stop hook (M4) records a
+//! run per completed turn from the hook's `last_assistant_message` while
+//! the session stays open for follow-up turns (decision 9).
 
 pub mod discover;
 pub mod install;
@@ -62,6 +64,12 @@ struct Tracked {
     context_tokens: u64,
     output_total: u64,
     files: Vec<String>,
+    /// Files touched since the last Stop hook: per-turn scope for runs.
+    /// ponytail: the first run after discovery absorbs all replayed history.
+    turn_files: Vec<String>,
+    /// Whether the last completed turn already recorded its run (Stop hook).
+    /// Cleared when the transcript moves (a new turn started).
+    turn_recorded: bool,
     /// Tools approved with always-allow for this session (hook-side).
     allowed: HashSet<String>,
     /// Live nudge card id, cleared when transcript activity resumes.
@@ -87,6 +95,8 @@ impl Tracked {
             context_tokens: 0,
             output_total: 0,
             files: Vec::new(),
+            turn_files: Vec::new(),
+            turn_recorded: false,
             allowed: HashSet::new(),
             nudge: None,
             pushed_title: String::new(),
@@ -147,7 +157,10 @@ impl Tracked {
                     activity.push(format!("> {}", tool.label));
                     if let Some(file) = tool.file {
                         if !self.files.contains(&file) {
-                            self.files.push(file);
+                            self.files.push(file.clone());
+                        }
+                        if !self.turn_files.contains(&file) {
+                            self.turn_files.push(file);
                         }
                     }
                 }
@@ -387,6 +400,29 @@ fn handle_hook_in(
                 },
             });
         }
+        HookIn::Stop {
+            session_id,
+            last_message,
+        } => {
+            clear_nudge(events, state, &session_id);
+            let mut st = state.lock().unwrap();
+            let Some(t) = st.get_mut(&session_id) else {
+                return;
+            };
+            if last_message.trim().is_empty() {
+                return; // no-op turn (e.g. session opened and immediately stopped)
+            }
+            t.turn_recorded = true;
+            let files = std::mem::take(&mut t.turn_files);
+            let _ = events.send(Envelope {
+                agent: "cc",
+                session_id,
+                event: AgentEvent::TurnFinished {
+                    outcome: truncate_chars(&last_message, OUTCOME_MAX),
+                    files,
+                },
+            });
+        }
         HookIn::Dropped { session_id } => {
             if let Some(p) = pendings.remove(&session_id) {
                 send_activity(
@@ -575,11 +611,19 @@ fn rescan(
         state.lock().unwrap().insert(t.info.session_id.clone(), t);
     }
     for t in finished {
-        let outcome = t
-            .last_text
-            .as_deref()
-            .map(|s| truncate_chars(s, OUTCOME_MAX))
-            .unwrap_or_else(|| "Session ended.".to_string());
+        // hooks installed: the last turn's run was recorded at its Stop; the
+        // session ending must not duplicate it. Without hooks, fall back to
+        // the transcript's final assistant message.
+        let outcome = if t.turn_recorded {
+            None
+        } else {
+            Some(
+                t.last_text
+                    .as_deref()
+                    .map(|s| truncate_chars(s, OUTCOME_MAX))
+                    .unwrap_or_else(|| "Session ended.".to_string()),
+            )
+        };
         let _ = events.send(Envelope {
             agent: "cc",
             session_id: t.info.session_id.clone(),
@@ -592,7 +636,7 @@ fn rescan(
             agent: "cc",
             session_id: t.info.session_id,
             event: AgentEvent::Finished {
-                outcome: Some(outcome),
+                outcome,
                 files: t.files,
                 stopped: false,
             },
@@ -620,6 +664,9 @@ fn stream(events: &UnboundedSender<Envelope>, state: &Shared, ticks: u64) {
                 ));
             }
             if moved {
+                // a new turn's output: the last recorded run no longer
+                // covers what the transcript holds
+                t.turn_recorded = false;
                 // the conversation moved: the user answered in the terminal
                 if let Some(nid) = t.nudge.take() {
                     outbox.push((
@@ -1359,5 +1406,102 @@ mod tests {
             "nudge clears when the conversation moves"
         );
         assert!(wait_for(|| tap.has_activity(">> answered in the terminal"), 5).await);
+    }
+
+    /// M4: the Stop hook records a run per completed turn while the session
+    /// stays open; ending the session does not duplicate the recorded run,
+    /// but a turn that dies without a Stop still gets its transcript run.
+    #[tokio::test]
+    async fn stop_hook_records_turn_runs_without_duplicating_finish() {
+        let sid = "aaaaaaaa-0000-0000-0000-000000000007";
+        let (config, registry, tap) = hook_env(sid, 30).await;
+
+        // turn 1: one file edit, then the Stop hook fires
+        let transcript = discover::transcript_path(&config.claude_projects_dir, M3_CWD, sid);
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        writeln!(
+            f,
+            "{}",
+            assistant(
+                r#"[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"src/a.ts","old_string":"a","new_string":"b"}}]"#
+            )
+        )
+        .unwrap();
+        assert!(
+            wait_for(|| tap.has_activity("> Edit src/a.ts +1 -1"), 8).await,
+            "turn-1 work tailed before the Stop arrives"
+        );
+
+        let reply = tokio::spawn(hook_ask(
+            config.socket_path.clone(),
+            serde_json::json!({
+                "type": "stop",
+                "sessionId": sid,
+                "lastMessage": "Done: fixed the hydration race and added an await.",
+            }),
+        ));
+        assert_eq!(
+            reply.await.unwrap().unwrap(),
+            serde_json::json!({"decision": "ack"})
+        );
+
+        assert!(
+            wait_for(
+                || {
+                    let snap = registry.snapshot();
+                    snap.runs.len() == 1 && snap.sessions.len() == 1
+                },
+                8
+            )
+            .await,
+            "run recorded while the session stays open"
+        );
+        let run = registry.snapshot().runs[0].clone();
+        assert!(run.outcome.starts_with("Done: fixed the hydration"));
+        assert_eq!(run.files, vec!["src/a.ts".to_string()]);
+        assert!(!run.stopped);
+
+        // turn 2 starts, then the terminal closes mid-turn: the finish path
+        // records a second run from the transcript's final message
+        writeln!(
+            f,
+            "{}",
+            assistant(
+                r#"[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"pnpm lint"}}]"#
+            )
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            assistant(r#"[{"type":"text","text":"lint is clean now"}]"#)
+        )
+        .unwrap();
+        assert!(wait_for(|| tap.has_activity("> Bash pnpm lint"), 8).await);
+        fs::remove_file(
+            config
+                .claude_sessions_dir
+                .join(format!("{}.json", std::process::id())),
+        )
+        .unwrap();
+
+        assert!(
+            wait_for(
+                || {
+                    let snap = registry.snapshot();
+                    snap.sessions.is_empty() && snap.runs.len() == 2
+                },
+                10
+            )
+            .await,
+            "session removed, second run recorded"
+        );
+        assert_eq!(registry.snapshot().runs[0].outcome, "lint is clean now");
+        assert!(registry.snapshot().runs[1]
+            .outcome
+            .starts_with("Done: fixed the hydration"));
     }
 }

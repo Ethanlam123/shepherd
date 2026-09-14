@@ -207,6 +207,24 @@ impl Registry {
                     emit_session(&inner, &env.session_id, sink);
                 }
             }
+            AgentEvent::TurnFinished { outcome, files } => {
+                if let Some(rec) = inner.sessions.get_mut(&env.session_id) {
+                    let run = crate::Run {
+                        id: self.next_run_id(),
+                        agent: rec.session.agent.clone(),
+                        title: rec.session.title.clone(),
+                        project: rec.session.project.clone(),
+                        ended_at: now_ms(),
+                        duration_ms: rec.session.elapsed_ms,
+                        tokens: rec.session.tokens,
+                        stopped: false,
+                        outcome,
+                        files,
+                    };
+                    inner.runs.insert(0, run.clone());
+                    sink.emit(UiEvent::Run(run));
+                }
+            }
             AgentEvent::Finished {
                 outcome,
                 files,
@@ -327,6 +345,8 @@ fn badge_check(inner: &mut Inner, sink: &dyn EventSink) {
 }
 
 /// Remove the session and record a run. Returns None if the session is gone.
+/// `outcome: None` without `stopped` records no run at all: the final turn
+/// was already recorded via TurnFinished, so ending must not duplicate it.
 fn finish(
     inner: &mut Inner,
     session_id: &str,
@@ -336,21 +356,32 @@ fn finish(
     stopped: bool,
 ) -> Option<crate::Run> {
     let rec = inner.sessions.remove(session_id)?;
-    let run = crate::Run {
-        id: run_id,
-        agent: rec.session.agent,
-        title: rec.session.title,
-        project: rec.session.project,
-        ended_at: now_ms(),
-        duration_ms: rec.session.elapsed_ms,
-        tokens: rec.session.tokens,
-        stopped,
-        outcome: if stopped {
-            STOPPED_OUTCOME.to_string()
-        } else {
-            outcome.unwrap_or_default()
-        },
-        files: if stopped { Vec::new() } else { files },
+    let run = if stopped {
+        crate::Run {
+            id: run_id,
+            agent: rec.session.agent,
+            title: rec.session.title,
+            project: rec.session.project,
+            ended_at: now_ms(),
+            duration_ms: rec.session.elapsed_ms,
+            tokens: rec.session.tokens,
+            stopped: true,
+            outcome: STOPPED_OUTCOME.to_string(),
+            files: Vec::new(),
+        }
+    } else {
+        crate::Run {
+            id: run_id,
+            agent: rec.session.agent,
+            title: rec.session.title,
+            project: rec.session.project,
+            ended_at: now_ms(),
+            duration_ms: rec.session.elapsed_ms,
+            tokens: rec.session.tokens,
+            stopped: false,
+            outcome: outcome?,
+            files,
+        }
     };
     inner.runs.insert(0, run.clone());
     Some(run)
@@ -524,6 +555,59 @@ mod tests {
         assert_eq!(snap.runs[0].outcome, STOPPED_OUTCOME);
         assert!(snap.runs[0].stopped);
         assert!(snap.runs[0].files.is_empty());
+    }
+
+    /// Per-turn runs (Stop hook): a run is recorded while the session stays
+    /// open for follow-up turns; the later Finished{None} removes the
+    /// session without a duplicate run.
+    #[test]
+    fn turn_finished_records_run_and_keeps_session() {
+        let (reg, sink) = registry();
+        reg.handle_event(started(session("cc-1")));
+        reg.handle_event(Envelope {
+            agent: "cc",
+            session_id: "cc-1".to_string(),
+            event: AgentEvent::TurnFinished {
+                outcome: "fixed the flake".to_string(),
+                files: vec!["hydrate.ts".to_string()],
+            },
+        });
+        let snap = reg.snapshot();
+        assert_eq!(snap.sessions.len(), 1, "session stays for follow-ups");
+        assert_eq!(snap.runs.len(), 1);
+        assert_eq!(snap.runs[0].outcome, "fixed the flake");
+        assert_eq!(snap.runs[0].files, vec!["hydrate.ts"]);
+        assert!(!snap.runs[0].stopped);
+        assert!(seen(&sink, "run:r0:false"));
+
+        reg.handle_event(Envelope {
+            agent: "cc",
+            session_id: "cc-1".to_string(),
+            event: AgentEvent::Finished {
+                outcome: None,
+                files: vec![],
+                stopped: false,
+            },
+        });
+        let snap = reg.snapshot();
+        assert!(snap.sessions.is_empty());
+        assert_eq!(snap.runs.len(), 1, "no duplicate run on session end");
+        assert!(seen(&sink, "removed:cc-1"));
+    }
+
+    /// TurnFinished for a session that already ended (race) is ignored.
+    #[test]
+    fn turn_finished_for_unknown_session_is_ignored() {
+        let (reg, _sink) = registry();
+        reg.handle_event(Envelope {
+            agent: "cc",
+            session_id: "ghost".to_string(),
+            event: AgentEvent::TurnFinished {
+                outcome: "late".to_string(),
+                files: vec![],
+            },
+        });
+        assert!(reg.snapshot().runs.is_empty());
     }
 
     #[test]

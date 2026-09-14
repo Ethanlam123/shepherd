@@ -25,6 +25,13 @@ pub enum HookIn {
         session_id: String,
         message: String,
     },
+    /// A turn of the session completed (Stop hook). `last_message` is the
+    /// hook payload's last_assistant_message - authoritative at Stop time,
+    /// where the transcript may not be flushed yet.
+    Stop {
+        session_id: String,
+        last_message: String,
+    },
     /// The hook process waiting on a permission died (Claude Code killed it
     /// at its own timeout): the card is stale, the tool already proceeded.
     Dropped {
@@ -131,6 +138,21 @@ async fn handle_conn(conn: UnixStream, tx: mpsc::UnboundedSender<HookIn>) -> std
                 session_id: session_id(&req),
                 message,
             });
+            Ok(())
+        }
+        Some("stop") => {
+            let last_message = req
+                .get("lastMessage")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let _ = tx.send(HookIn::Stop {
+                session_id: session_id(&req),
+                last_message,
+            });
+            // the hook never blocks on our answer; ack so it exits promptly
+            write_half.write_all(b"{\"decision\":\"ack\"}\n").await?;
+            write_half.shutdown().await?;
             Ok(())
         }
         _ => Ok(()),
