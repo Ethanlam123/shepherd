@@ -38,6 +38,15 @@ impl Store {
                  key TEXT PRIMARY KEY, value TEXT NOT NULL);
              DELETE FROM sessions;",
         )?;
+        // migration for databases created before the pending column
+        conn.execute("ALTER TABLE sessions ADD COLUMN pending TEXT", ())
+            .or_else(|e| {
+                if e.to_string().contains("duplicate column") {
+                    Ok(0)
+                } else {
+                    Err(e)
+                }
+            })?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
