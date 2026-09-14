@@ -39,15 +39,28 @@ pub enum HookIn {
     },
 }
 
-/// Bind the socket, removing a stale file first. The parent directory is
-/// created 0700 so only the same user can reach the socket.
+/// Bind the socket, taking over only a stale file. The parent directory is
+/// created 0700 so only the same user can reach the socket. If another
+/// Shepherd instance is still serving this socket, refuse instead of
+/// stealing it out from under the live one.
 pub fn bind(path: &std::path::Path) -> std::io::Result<UnixListener> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
-    let _ = std::fs::remove_file(path); // stale socket from a crashed instance
+    if path.exists() {
+        if std::os::unix::net::UnixStream::connect(path).is_ok() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "another Shepherd instance is serving {}; not taking it over",
+                    path.display()
+                ),
+            ));
+        }
+        let _ = std::fs::remove_file(path); // stale socket from a crashed instance
+    }
     UnixListener::bind(path)
 }
 
@@ -59,12 +72,12 @@ pub async fn serve(listener: UnixListener, tx: mpsc::UnboundedSender<HookIn>) {
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_conn(conn, tx).await {
-                        eprintln!("shepherd: hook connection error: {e}");
+                        log::warn!("hook connection error: {e}");
                     }
                 });
             }
             Err(e) => {
-                eprintln!("shepherd: hook accept error: {e}");
+                log::error!("hook accept error: {e}");
                 return;
             }
         }
@@ -172,5 +185,34 @@ async fn read_line(
             std::io::ErrorKind::TimedOut,
             "hook request line timeout",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind;
+
+    #[tokio::test]
+    async fn bind_refuses_while_another_instance_serves() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s.sock");
+        let first = bind(&sock).unwrap();
+        let err = bind(&sock).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        drop(first);
+        // the dead listener leaves its socket file behind: rebind takes it
+        let second = bind(&sock);
+        assert!(
+            second.is_ok(),
+            "stale socket must be rebindable: {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_takes_over_a_stale_non_socket_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s.sock");
+        std::fs::write(&sock, b"junk").unwrap();
+        assert!(bind(&sock).is_ok());
     }
 }
