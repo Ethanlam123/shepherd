@@ -192,3 +192,170 @@ pub trait AgentAdapter: Send + Sync {
     fn display_name(&self) -> &'static str;
     fn spawn(self: Box<Self>, ctx: AdapterContext);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The panel sends controls as {"type":"...", ...} with camelCase fields.
+    /// This is the wire contract with ui/panel.ts: if either side drifts,
+    /// this breaks first.
+    #[test]
+    fn control_wire_format_matches_panel() {
+        type Check = Box<dyn Fn(&Control) -> bool>;
+        let cases: Vec<(&str, serde_json::Value, Check)> = vec![
+            (
+                "approve",
+                json!({"type":"approve","pendingId":"p1"}),
+                Box::new(
+                    |c| matches!(c, Control::Approve { pending_id } if pending_id.as_str() == "p1"),
+                ),
+            ),
+            (
+                "approve_always",
+                json!({"type":"approve_always","pendingId":"p1","tool":"Bash"}),
+                Box::new(
+                    |c| matches!(c, Control::ApproveAlways { pending_id, tool } if pending_id.as_str() == "p1" && tool.as_str() == "Bash"),
+                ),
+            ),
+            (
+                "approve_edited",
+                json!({"type":"approve_edited","pendingId":"p1","command":"echo hi"}),
+                Box::new(
+                    |c| matches!(c, Control::ApproveEdited { pending_id, command } if pending_id.as_str() == "p1" && command.as_str() == "echo hi"),
+                ),
+            ),
+            (
+                "deny with note",
+                json!({"type":"deny","pendingId":"p1","note":"nope"}),
+                Box::new(
+                    |c| matches!(c, Control::Deny { pending_id, note } if pending_id.as_str() == "p1" && note.as_deref() == Some("nope")),
+                ),
+            ),
+            (
+                "deny plain",
+                json!({"type":"deny","pendingId":"p1","note":null}),
+                Box::new(|c| matches!(c, Control::Deny { note: None, .. })),
+            ),
+            (
+                "deny missing note",
+                json!({"type":"deny","pendingId":"p1"}),
+                Box::new(|c| matches!(c, Control::Deny { note: None, .. })),
+            ),
+            (
+                "answer",
+                json!({"type":"answer","pendingId":"p1","text":"yes"}),
+                Box::new(
+                    |c| matches!(c, Control::Answer { pending_id, text } if pending_id.as_str() == "p1" && text.as_str() == "yes"),
+                ),
+            ),
+            (
+                "pause",
+                json!({"type":"pause"}),
+                Box::new(|c| matches!(c, Control::Pause)),
+            ),
+            (
+                "resume",
+                json!({"type":"resume"}),
+                Box::new(|c| matches!(c, Control::Resume)),
+            ),
+            (
+                "stop",
+                json!({"type":"stop"}),
+                Box::new(|c| matches!(c, Control::Stop)),
+            ),
+        ];
+        for (name, raw, check) in cases {
+            let c: Control = serde_json::from_value(raw)
+                .unwrap_or_else(|e| panic!("{name}: should deserialize: {e}"));
+            assert!(check(&c), "{name}: wrong variant");
+        }
+    }
+
+    #[test]
+    fn unknown_control_type_is_rejected() {
+        assert!(serde_json::from_value::<Control>(json!({"type":"explode"})).is_err());
+    }
+
+    #[test]
+    fn pending_wire_format_is_internally_tagged() {
+        let perm = Pending::Permission(PendingPermission {
+            id: "p1".into(),
+            tool: "Bash".into(),
+            command: "pnpm test".into(),
+            reason: "run tests".into(),
+        });
+        let v = serde_json::to_value(&perm).unwrap();
+        assert_eq!(v["kind"], "permission");
+        assert_eq!(v["id"], "p1");
+        assert_eq!(v["tool"], "Bash");
+        assert_eq!(v["command"], "pnpm test");
+        assert_eq!(v["reason"], "run tests");
+
+        let input = Pending::Input(PendingInput {
+            id: "p2".into(),
+            question: "Which way?".into(),
+            suggestions: vec!["A".into(), "B".into()],
+        });
+        let v = serde_json::to_value(&input).unwrap();
+        assert_eq!(v["kind"], "input");
+        assert_eq!(v["question"], "Which way?");
+        assert_eq!(v["suggestions"], json!(["A", "B"]));
+    }
+
+    #[test]
+    fn session_wire_format_is_camel_case() {
+        let s = Session {
+            id: "cc-1".into(),
+            agent: "cc".into(),
+            title: "t".into(),
+            project: "p".into(),
+            cwd: "~/code/p".into(),
+            status: Status::Waiting,
+            started_at: 123,
+            elapsed_ms: 45,
+            tokens: 678,
+            allowed_tools: vec!["Bash".into()],
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["id"], "cc-1");
+        assert_eq!(v["status"], "waiting"); // snake_case enum only
+        assert_eq!(v["startedAt"], 123);
+        assert_eq!(v["elapsedMs"], 45);
+        assert_eq!(v["allowedTools"], json!(["Bash"]));
+    }
+
+    #[test]
+    fn run_wire_format_is_camel_case() {
+        let r = Run {
+            id: "r0".into(),
+            agent: "cc".into(),
+            title: "t".into(),
+            project: "p".into(),
+            ended_at: 1000,
+            duration_ms: 2000,
+            tokens: 3000,
+            stopped: true,
+            outcome: "o".into(),
+            files: vec!["a.ts".into()],
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["endedAt"], 1000);
+        assert_eq!(v["durationMs"], 2000);
+        assert_eq!(v["stopped"], true);
+    }
+
+    #[test]
+    fn log_line_wire_format() {
+        let v = serde_json::to_value(&LogLine {
+            ts: 5,
+            kind: "tool".into(),
+            text: "x".into(),
+        })
+        .unwrap();
+        assert_eq!(v["ts"], 5);
+        assert_eq!(v["kind"], "tool");
+        assert_eq!(v["text"], "x");
+    }
+}

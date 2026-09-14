@@ -479,6 +479,9 @@ impl LoopCtx {
         }
         // prototype respawns one session per normal finish, 16-25s later
         for _ in &finished {
+            if self.pool.is_empty() {
+                continue;
+            }
             let idx = self.pool_idx.fetch_add(1, Ordering::Relaxed) as usize % self.pool.len();
             let script = self.pool[idx].clone();
             let ctx = self.clone();
@@ -682,5 +685,463 @@ mod tests {
                 script.title
             );
         }
+    }
+
+    // ---------- lifecycle tests on a paused virtual clock ----------
+    //
+    // Each test runs the real pipeline - adapter loop, channels, registry,
+    // sink - with start_paused so 1s ticks and respawn sleeps fast-forward
+    // when the runtime is idle. These assert the behavioral shapes of the
+    // acceptance criteria (approve, always-allow, edited, deny+note, answer,
+    // pause/resume, stop, respawn) against mock scripts.
+
+    use crate::registry::{EventSink, Registry, Snapshot, UiEvent};
+    use crate::{AdapterContext, AgentAdapter, Pending};
+    use tokio::sync::mpsc::unbounded_channel;
+
+    /// Records everything the registry emits.
+    struct Tap(Mutex<Vec<UiEvent>>);
+    impl EventSink for Tap {
+        fn emit(&self, event: UiEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+    impl Tap {
+        fn has_activity(&self, pat: &str) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, UiEvent::Activity { line, .. } if line.text.contains(pat)))
+        }
+    }
+
+    struct Harness {
+        registry: Arc<Registry>,
+        tap: Arc<Tap>,
+    }
+
+    fn harness(agent: &'static str, initial: Vec<Script>, pool: Vec<Script>) -> Harness {
+        let tap = Arc::new(Tap(Mutex::new(Vec::new())));
+        let registry = Arc::new(Registry::new(tap.clone() as Arc<dyn EventSink>));
+        let (ctl_tx, ctl_rx) = unbounded_channel();
+        registry.register_adapter(agent, ctl_tx);
+        let (ev_tx, mut ev_rx) = unbounded_channel();
+        let boxed: Box<dyn AgentAdapter> = Box::new(MockAdapter {
+            agent,
+            initial,
+            pool,
+        });
+        boxed.spawn(AdapterContext {
+            events: ev_tx,
+            controls: ctl_rx,
+            spawn: Arc::new(|f| {
+                tokio::spawn(f);
+            }),
+        });
+        let reg = registry.clone();
+        tokio::spawn(async move {
+            while let Some(env) = ev_rx.recv().await {
+                reg.handle_event(env);
+            }
+        });
+        Harness { registry, tap }
+    }
+
+    /// Poll cond until true, advancing virtual seconds. On a paused clock the
+    /// sleep fast-forwards through the mock's interval ticks.
+    async fn wait_for(mut cond: impl FnMut() -> bool, secs: u64) -> bool {
+        for _ in 0..secs {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        cond()
+    }
+
+    /// (session id, pending id) of the first waiting session.
+    fn first_pending(snap: &Snapshot) -> (String, String) {
+        let s = snap
+            .sessions
+            .iter()
+            .find(|s| s.pending.is_some())
+            .expect("waiting session");
+        let pid = match s.pending.as_ref().expect("pending") {
+            Pending::Permission(p) => p.id.clone(),
+            Pending::Input(p) => p.id.clone(),
+        };
+        (s.session.id.clone(), pid)
+    }
+
+    fn one_permission_script() -> Script {
+        Script {
+            title: "one permission",
+            project: "p",
+            steps: vec![
+                l(2, "tool", "> Read main.rs"),
+                p(4, "Bash", "pnpm test", "run the test suite"),
+                f(7, "tests passed and done", &[]),
+            ],
+        }
+    }
+
+    /// Acceptance shape: permission card appears, approve reaches the agent,
+    /// the session resumes and finishes with outcome and files intact.
+    #[tokio::test(start_paused = true)]
+    async fn permission_round_trip_end_to_end() {
+        let h = harness("cc", vec![script_auth()], vec![]);
+        assert!(
+            wait_for(|| {
+                let snap = h.registry.snapshot();
+                snap.sessions.iter().any(|s| {
+                    matches!(&s.pending, Some(Pending::Permission(p)) if p.command.contains("prisma migrate reset"))
+                })
+            }, 20)
+            .await,
+            "permission card appears ~12s in"
+        );
+        assert_eq!(h.registry.waiting_count(), 1);
+        let (sid, pid) = first_pending(&h.registry.snapshot());
+
+        h.registry
+            .handle_control(&sid, Control::Approve { pending_id: pid });
+        assert!(
+            wait_for(
+                || {
+                    let snap = h.registry.snapshot();
+                    snap.sessions
+                        .iter()
+                        .any(|s| s.session.id == sid && s.session.status == Status::Running)
+                },
+                5
+            )
+            .await,
+            "session resumes after approve"
+        );
+        assert!(
+            wait_for(|| h.tap.has_activity("OK approved Bash"), 5).await,
+            "approve is logged by the adapter"
+        );
+
+        assert!(
+            wait_for(
+                || {
+                    let snap = h.registry.snapshot();
+                    snap.runs.iter().any(|r| {
+                        r.outcome.contains("typed Session records")
+                            && r.files.len() == 3
+                            && !r.stopped
+                    })
+                },
+                40
+            )
+            .await,
+            "run recorded with outcome and files"
+        );
+        assert!(wait_for(|| h.registry.snapshot().sessions.is_empty(), 5).await);
+    }
+
+    /// Acceptance criterion 2 shape: after ApproveAlways, later permissions
+    /// for the same tool never wait; they are logged as auto-approved.
+    #[tokio::test(start_paused = true)]
+    async fn always_allow_auto_approves_later_permissions() {
+        let script = Script {
+            title: "two permissions",
+            project: "p",
+            steps: vec![
+                p(2, "Bash", "echo one", "first"),
+                p(6, "Bash", "echo two", "second"),
+                f(9, "both commands ran", &[]),
+            ],
+        };
+        let h = harness("cc", vec![script], vec![]);
+        assert!(
+            wait_for(|| h.registry.waiting_count() == 1, 10).await,
+            "first permission waits"
+        );
+        let (sid, pid) = first_pending(&h.registry.snapshot());
+
+        h.registry.handle_control(
+            &sid,
+            Control::ApproveAlways {
+                pending_id: pid,
+                tool: "Bash".to_string(),
+            },
+        );
+
+        // let virtual time run past the 6s gate for the second permission
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(
+            h.registry.waiting_count(),
+            0,
+            "second Bash permission must never wait"
+        );
+        assert!(h
+            .tap
+            .has_activity("Auto-approved Bash (always allowed this session)"));
+        assert!(
+            wait_for(|| h.registry.snapshot().runs.len() == 1, 15).await,
+            "finishes normally"
+        );
+    }
+
+    /// Acceptance criterion 3 shape: the agent runs exactly the edited
+    /// command and the log carries both the marker and the edited form.
+    #[tokio::test(start_paused = true)]
+    async fn approve_edited_logs_edited_command() {
+        let h = harness("cc", vec![one_permission_script()], vec![]);
+        assert!(wait_for(|| h.registry.waiting_count() == 1, 10).await);
+        let (sid, pid) = first_pending(&h.registry.snapshot());
+
+        h.registry.handle_control(
+            &sid,
+            Control::ApproveEdited {
+                pending_id: pid,
+                command: "pnpm test --filter unit".to_string(),
+            },
+        );
+
+        assert!(wait_for(|| h.tap.has_activity("OK approved (edited):"), 5).await);
+        assert!(wait_for(|| h.tap.has_activity("pnpm test --filter unit"), 5).await);
+        assert!(wait_for(|| h.registry.snapshot().runs.len() == 1, 20).await);
+    }
+
+    /// Acceptance criterion 4 shape: the note reaches the agent's log;
+    /// an empty note sends the default plain-deny message.
+    #[tokio::test(start_paused = true)]
+    async fn deny_with_note_reaches_the_log() {
+        let h = harness("cc", vec![one_permission_script()], vec![]);
+        assert!(wait_for(|| h.registry.waiting_count() == 1, 10).await);
+        let (sid, pid) = first_pending(&h.registry.snapshot());
+
+        h.registry.handle_control(
+            &sid,
+            Control::Deny {
+                pending_id: pid,
+                note: Some("nope, use git clean".to_string()),
+            },
+        );
+
+        assert!(wait_for(|| h.tap.has_activity("X denied: nope, use git clean"), 5).await);
+        assert!(wait_for(|| h.registry.snapshot().runs.len() == 1, 20).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deny_without_note_sends_default_message() {
+        let h = harness("cc", vec![one_permission_script()], vec![]);
+        assert!(wait_for(|| h.registry.waiting_count() == 1, 10).await);
+        let (sid, pid) = first_pending(&h.registry.snapshot());
+
+        h.registry.handle_control(
+            &sid,
+            Control::Deny {
+                pending_id: pid,
+                note: None,
+            },
+        );
+
+        assert!(
+            wait_for(
+                || h.tap
+                    .has_activity("X denied: Denied - take a different approach."),
+                5
+            )
+            .await,
+            "empty note becomes the plain-deny default"
+        );
+        assert!(wait_for(|| h.registry.snapshot().runs.len() == 1, 20).await);
+    }
+
+    /// Input requests surface suggestions and accept an answer.
+    #[tokio::test(start_paused = true)]
+    async fn input_question_flow_accepts_answer() {
+        let h = harness("oc", vec![script_mdx()], vec![]);
+        assert!(
+            wait_for(
+                || {
+                    let snap = h.registry.snapshot();
+                    snap.sessions.iter().any(|s| {
+                    matches!(&s.pending, Some(Pending::Input(q)) if q.suggestions.len() == 2)
+                })
+                },
+                15
+            )
+            .await,
+            "input card with two suggestions appears ~8s in"
+        );
+        let (sid, pid) = first_pending(&h.registry.snapshot());
+
+        h.registry.handle_control(
+            &sid,
+            Control::Answer {
+                pending_id: pid,
+                text: "Convert and keep redirects".to_string(),
+            },
+        );
+
+        assert!(
+            wait_for(
+                || h.tap
+                    .has_activity("OK your answer: Convert and keep redirects"),
+                5
+            )
+            .await
+        );
+        assert!(
+            wait_for(
+                || {
+                    let snap = h.registry.snapshot();
+                    snap.runs
+                        .iter()
+                        .any(|r| r.outcome.contains("All 38 docs pages"))
+                },
+                30
+            )
+            .await
+        );
+    }
+
+    /// Acceptance criterion 6 shape: pause freezes both the script gates and
+    /// the elapsed timer; resume continues both.
+    #[tokio::test(start_paused = true)]
+    async fn pause_freezes_script_and_elapsed_then_resume_continues() {
+        let script = Script {
+            title: "paced",
+            project: "p",
+            steps: vec![
+                l(2, "tool", "> first step"),
+                l(10, "tool", "> second step"),
+                f(13, "paced work done", &[]),
+            ],
+        };
+        let h = harness("cc", vec![script], vec![]);
+        assert!(wait_for(|| h.tap.has_activity("> first step"), 10).await);
+
+        let paused_id = h.registry.snapshot().sessions[0].session.id.clone();
+        h.registry.handle_control(&paused_id, Control::Pause);
+        assert!(
+            wait_for(
+                || h.registry.snapshot().sessions[0].session.status == Status::Paused,
+                5
+            )
+            .await
+        );
+
+        let frozen = h.registry.snapshot().sessions[0].session.elapsed_ms;
+        tokio::time::sleep(Duration::from_secs(20)).await; // past the 10s gate, still paused
+        let snap = h.registry.snapshot();
+        assert_eq!(
+            snap.sessions[0].session.elapsed_ms, frozen,
+            "elapsed frozen while paused"
+        );
+        assert!(
+            !h.tap.has_activity("> second step"),
+            "script frozen while paused"
+        );
+
+        h.registry
+            .handle_control(&snap.sessions[0].session.id, Control::Resume);
+        assert!(
+            wait_for(|| h.tap.has_activity("> second step"), 15).await,
+            "script continues after resume"
+        );
+        assert!(wait_for(|| h.registry.snapshot().runs.len() == 1, 15).await);
+    }
+
+    /// Acceptance criterion 5 shape: stop records a stopped run with the
+    /// fixed outcome text, no files, and never respawns.
+    #[tokio::test(start_paused = true)]
+    async fn stop_records_stopped_run_and_never_respawns() {
+        let script = Script {
+            title: "long work",
+            project: "p",
+            steps: vec![
+                l(2, "tool", "> working"),
+                p(40, "Bash", "deploy", "deploy it"),
+                f(50, "done", &[]),
+            ],
+        };
+        let respawn = Script {
+            title: "respawn",
+            project: "p",
+            steps: vec![f(4, "respawned and finished", &[])],
+        };
+        let h = harness("cc", vec![script], vec![respawn]);
+
+        assert!(wait_for(|| !h.registry.snapshot().sessions.is_empty(), 5).await);
+        h.registry
+            .handle_control(&h.registry.snapshot().sessions[0].session.id, Control::Stop);
+
+        assert!(
+            wait_for(
+                || {
+                    let snap = h.registry.snapshot();
+                    snap.runs.len() == 1
+                        && snap.runs[0].stopped
+                        && snap.runs[0].outcome == crate::registry::STOPPED_OUTCOME
+                        && snap.runs[0].files.is_empty()
+                },
+                5
+            )
+            .await,
+            "stopped run recorded"
+        );
+
+        // burn past the 16-25s respawn window: a stopped session stays dead
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let snap = h.registry.snapshot();
+        assert!(snap.sessions.is_empty(), "stopped session never respawns");
+        assert_eq!(snap.runs.len(), 1);
+    }
+
+    /// Normal finishes respawn from the agent's pool (prototype behavior).
+    #[tokio::test(start_paused = true)]
+    async fn normal_finish_respawns_from_pool() {
+        let first = Script {
+            title: "first",
+            project: "p",
+            steps: vec![f(3, "first done", &[])],
+        };
+        let second = Script {
+            title: "second",
+            project: "p",
+            steps: vec![l(2, "tool", "> respawned step"), f(5, "second done", &[])],
+        };
+        let h = harness("cc", vec![first], vec![second]);
+
+        assert!(
+            wait_for(|| h.registry.snapshot().runs.len() == 1, 10).await,
+            "first finishes"
+        );
+        assert!(
+            wait_for(
+                || {
+                    let snap = h.registry.snapshot();
+                    snap.sessions.iter().any(|s| s.session.title == "second")
+                },
+                35
+            )
+            .await,
+            "respawn appears 16-25s later"
+        );
+        assert!(
+            wait_for(|| h.registry.snapshot().runs.len() == 2, 15).await,
+            "respawn finishes"
+        );
+    }
+
+    /// An adapter with an empty pool tolerates normal finishes (respawn guard).
+    #[tokio::test(start_paused = true)]
+    async fn empty_pool_finish_does_not_panic() {
+        let script = Script {
+            title: "once only",
+            project: "p",
+            steps: vec![f(3, "done", &[])],
+        };
+        let h = harness("cc", vec![script], vec![]);
+        assert!(wait_for(|| h.registry.snapshot().runs.len() == 1, 10).await);
+        tokio::time::sleep(Duration::from_secs(30)).await; // would panic at respawn without the guard
+        assert!(h.registry.snapshot().sessions.is_empty());
     }
 }

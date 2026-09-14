@@ -544,4 +544,194 @@ mod tests {
         reg.handle_control("cc-1", Control::Resume);
         assert_eq!(reg.snapshot().sessions[0].session.status, Status::Waiting);
     }
+
+    #[test]
+    fn progress_updates_elapsed_and_tokens() {
+        let (reg, sink) = registry();
+        reg.handle_event(started(session("cc-1")));
+        reg.handle_event(Envelope {
+            agent: "cc",
+            session_id: "cc-1".to_string(),
+            event: AgentEvent::Progress {
+                elapsed_ms: 12_000,
+                tokens: 55_000,
+            },
+        });
+        let snap = reg.snapshot();
+        assert_eq!(snap.sessions[0].session.elapsed_ms, 12_000);
+        assert_eq!(snap.sessions[0].session.tokens, 55_000);
+        // progress emits a session event so the panel can correct its timer
+        assert!(seen(&sink, "session:cc-1"));
+    }
+
+    #[test]
+    fn failed_event_records_failed_run() {
+        let (reg, _sink) = registry();
+        reg.handle_event(started(session("cc-1")));
+        reg.handle_event(Envelope {
+            agent: "cc",
+            session_id: "cc-1".to_string(),
+            event: AgentEvent::Failed {
+                message: "hook died".to_string(),
+            },
+        });
+        let snap = reg.snapshot();
+        assert!(snap.sessions.is_empty());
+        assert_eq!(snap.runs.len(), 1);
+        assert_eq!(snap.runs[0].outcome, "Failed: hook died");
+        assert!(!snap.runs[0].stopped);
+    }
+
+    /// Unknown agents must never crash the registry (spec: unknown agents
+    /// never crash the panel).
+    #[test]
+    fn events_for_unknown_session_are_ignored() {
+        let (reg, sink) = registry();
+        reg.handle_event(Envelope {
+            agent: "cc",
+            session_id: "ghost".to_string(),
+            event: AgentEvent::Activity {
+                kind: "tool".to_string(),
+                line: "x".to_string(),
+            },
+        });
+        reg.handle_event(permission("ghost", "p1"));
+        reg.handle_event(Envelope {
+            agent: "cc",
+            session_id: "ghost".to_string(),
+            event: AgentEvent::Finished {
+                outcome: None,
+                files: vec![],
+                stopped: false,
+            },
+        });
+        let snap = reg.snapshot();
+        assert!(snap.sessions.is_empty());
+        assert!(snap.runs.is_empty());
+        assert!(!seen(&sink, "badge:1"));
+    }
+
+    #[test]
+    fn badge_emitted_only_when_count_changes() {
+        let (reg, sink) = registry();
+        reg.handle_event(started(session("cc-1")));
+        reg.handle_event(started(session("cc-2"))); // ids differ, agent same
+        reg.handle_event(permission("cc-1", "p1"));
+        reg.handle_event(permission("cc-2", "p1"));
+        let badges: Vec<String> = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|x| x.starts_with("badge:"))
+            .cloned()
+            .collect();
+        // 0 -> 1 -> 2, exactly one emit per change, no duplicates
+        assert_eq!(badges, vec!["badge:1".to_string(), "badge:2".to_string()]);
+    }
+
+    #[test]
+    fn controls_route_to_owning_adapter() {
+        let (reg, _sink) = registry();
+        let (cc_tx, mut cc_rx) = mpsc::unbounded_channel();
+        let (oc_tx, mut oc_rx) = mpsc::unbounded_channel();
+        reg.register_adapter("cc", cc_tx);
+        reg.register_adapter("oc", oc_tx);
+
+        let mut s = session("oc-1");
+        s.agent = "oc".to_string();
+        reg.handle_event(started(s));
+        assert!(reg.handle_control("oc-1", Control::Pause));
+
+        assert!(matches!(
+            cc_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(oc_rx.try_recv(), Ok((sid, Control::Pause)) if sid == "oc-1"));
+    }
+
+    #[test]
+    fn snapshot_orders_sessions_by_started_at() {
+        let (reg, _sink) = registry();
+        let mut older = session("cc-2");
+        older.started_at = 1_000;
+        let mut newer = session("cc-3");
+        newer.started_at = 2_000;
+        reg.handle_event(started(older)); // inserted first, older timestamp
+        reg.handle_event(started(newer));
+        let snap = reg.snapshot();
+        assert_eq!(snap.sessions[0].session.id, "cc-2");
+        assert_eq!(snap.sessions[1].session.id, "cc-3");
+    }
+
+    /// State applies even if the owning adapter is gone (send fails
+    /// silently); the user still gets a consistent panel.
+    #[test]
+    fn control_applies_state_without_registered_adapter() {
+        let (reg, _sink) = registry();
+        reg.handle_event(started(session("cc-1")));
+        reg.handle_event(permission("cc-1", "p1"));
+        assert!(reg.handle_control(
+            "cc-1",
+            Control::Approve {
+                pending_id: "p1".to_string()
+            }
+        ));
+        let snap = reg.snapshot();
+        assert_eq!(snap.sessions[0].session.status, Status::Running);
+        assert!(snap.sessions[0].pending.is_none());
+    }
+
+    #[test]
+    fn deny_and_answer_clear_waiting() {
+        let (reg, _sink) = registry();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        reg.register_adapter("cc", tx);
+        reg.handle_event(started(session("cc-1")));
+        reg.handle_event(permission("cc-1", "p1"));
+        assert!(reg.handle_control(
+            "cc-1",
+            Control::Deny {
+                pending_id: "p1".to_string(),
+                note: Some("no".to_string())
+            }
+        ));
+        assert_eq!(reg.snapshot().sessions[0].session.status, Status::Running);
+
+        reg.handle_event(permission("cc-1", "p2"));
+        assert!(reg.handle_control(
+            "cc-1",
+            Control::Answer {
+                pending_id: "p2".to_string(),
+                text: "yes".to_string()
+            }
+        ));
+        assert_eq!(reg.snapshot().sessions[0].session.status, Status::Running);
+        assert_eq!(reg.waiting_count(), 0);
+    }
+
+    /// Snapshot sessions carry session fields at the top level (serde
+    /// flatten) with the pending prompt and activity tail beside them.
+    #[test]
+    fn ui_session_flattens_in_snapshot() {
+        let (reg, _sink) = registry();
+        reg.handle_event(started(session("cc-1")));
+        reg.handle_event(permission("cc-1", "p1"));
+        reg.handle_event(Envelope {
+            agent: "cc",
+            session_id: "cc-1".to_string(),
+            event: AgentEvent::Activity {
+                kind: "tool".to_string(),
+                line: "> Read x".to_string(),
+            },
+        });
+        let snap = reg.snapshot();
+        let v = serde_json::to_value(&snap).unwrap();
+        let s = &v["sessions"][0];
+        assert_eq!(s["id"], "cc-1");
+        assert_eq!(s["status"], "waiting");
+        assert_eq!(s["pending"]["kind"], "permission");
+        assert_eq!(s["pending"]["tool"], "Bash");
+        assert_eq!(s["activity"][0]["text"], "> Read x");
+    }
 }

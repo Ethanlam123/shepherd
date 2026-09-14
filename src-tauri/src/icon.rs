@@ -104,3 +104,36 @@ fn is_dark_menu() -> bool {
         })
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn badge_label_caps_at_nine_plus() {
+        let svg = crook_svg("#1d1d1f", Some((10, "#1d1d1f")));
+        assert!(svg.contains(">9+</text>"), "counts above 9 render as 9+");
+        let svg = crook_svg("#1d1d1f", Some((3, "#1d1d1f")));
+        assert!(svg.contains(">3</text>"));
+    }
+
+    #[test]
+    fn crook_svg_contains_cradled_dot() {
+        let svg = crook_svg("#000000", None);
+        assert!(svg.contains(r##"<circle cx="11" cy="8.6" r="1.7""##));
+        assert!(svg.contains("stroke-width=\"1.8\""));
+    }
+
+    #[test]
+    fn template_icon_renders_at_canvas_size() {
+        let img = render(&crook_svg("#000000", None)).expect("template crook renders");
+        assert_eq!((img.width(), img.height()), (CANVAS, CANVAS));
+    }
+
+    #[test]
+    fn badge_icon_renders_with_text() {
+        // exercises system font loading; degrades to dot-only if fonts fail
+        let img = render(&crook_svg("#1d1d1f", Some((2, "#1d1d1f")))).expect("badge renders");
+        assert_eq!((img.width(), img.height()), (CANVAS, CANVAS));
+    }
+}

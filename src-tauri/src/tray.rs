@@ -101,6 +101,14 @@ pub fn refresh_badge(app: &AppHandle, count: usize) {
     }
 }
 
+/// Clamp the panel's centered x so it stays on the tray's monitor with an
+/// 8px inset. Pure math, unit-tested.
+fn clamp_panel_x(center_x: f64, win_w: f64, mon_x: f64, mon_w: f64) -> f64 {
+    let min_x = mon_x + 8.0;
+    let max_x = (mon_x + mon_w - win_w - 8.0).max(min_x);
+    center_x.clamp(min_x, max_x)
+}
+
 /// Center the panel under the tray icon, clamped to its monitor.
 fn position(win: &WebviewWindow, app: &AppHandle) {
     let Some(rect) = app.tray_by_id("main").and_then(|t| t.rect().ok().flatten()) else {
@@ -120,10 +128,7 @@ fn position(win: &WebviewWindow, app: &AppHandle) {
     let y = ry + rh + 6.0 * scale;
     if let Ok(Some(mon)) = win.current_monitor() {
         let mon_x = mon.position().x as f64;
-        let mon_right = mon_x + mon.size().width as f64;
-        let min_x = mon_x + 8.0;
-        let max_x = (mon_right - win_w - 8.0).max(min_x);
-        x = x.clamp(min_x, max_x);
+        x = clamp_panel_x(x, win_w, mon_x, mon.size().width as f64);
     }
     let _ = win.set_position(tauri::PhysicalPosition::new(x as i32, y as i32));
 }
@@ -137,4 +142,33 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_panel_x;
+
+    #[test]
+    fn panel_x_stays_centered_when_it_fits() {
+        // monitor 0..2000, window 400, tray centered at 1000
+        assert!((clamp_panel_x(800.0, 400.0, 0.0, 2000.0) - 800.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn panel_x_clamps_on_the_left() {
+        // tray icon far left: centered x would be negative
+        assert_eq!(clamp_panel_x(-100.0, 400.0, 0.0, 2000.0), 8.0);
+    }
+
+    #[test]
+    fn panel_x_clamps_on_the_right() {
+        // tray icon far right on a 2000px monitor: 1600 > max 1592
+        assert_eq!(clamp_panel_x(1900.0, 400.0, 0.0, 2000.0), 1592.0);
+    }
+
+    #[test]
+    fn panel_x_degrades_to_inset_on_monitor_narrower_than_window() {
+        // window wider than monitor: max collapses to min
+        assert_eq!(clamp_panel_x(50.0, 800.0, 0.0, 600.0), 8.0);
+    }
 }
