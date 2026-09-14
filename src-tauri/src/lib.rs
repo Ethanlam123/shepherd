@@ -6,17 +6,23 @@ mod tray;
 
 use serde::Serialize;
 use shepherd_core::config::ShepherdConfig;
-use shepherd_core::registry::{EventSink, UiEvent};
+use shepherd_core::registry::{EventSink, UiEvent, UiSession};
 use shepherd_core::store::Store;
-use shepherd_core::{cc, mock, AdapterContext, AgentAdapter};
-use std::sync::Arc;
+use shepherd_core::{cc, mock, AdapterContext, AgentAdapter, Pending, Status};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, WindowEvent};
+use tauri_plugin_notification::NotificationExt;
 use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
 
-/// Bridges registry events to the webview, the tray badge, and the store.
+/// Bridges registry events to the webview, the tray badge, the store, and
+/// (M4) macOS notifications.
 struct AppSink {
     app: tauri::AppHandle,
     store: Arc<Store>,
+    /// Sessions already notified for their current wait, so one card fires
+    /// exactly one notification. Cleared when the session resumes or ends.
+    notified: Mutex<HashSet<String>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -41,11 +47,13 @@ impl EventSink for AppSink {
                 if let Err(e) = self.store.upsert_session(s) {
                     eprintln!("shepherd: persist session failed: {e}");
                 }
+                self.maybe_notify(s);
             }
             UiEvent::Removed { session_id } => {
                 if let Err(e) = self.store.remove_session(session_id) {
                     eprintln!("shepherd: remove session failed: {e}");
                 }
+                self.notified.lock().unwrap().remove(session_id);
             }
             UiEvent::Run(r) => {
                 if let Err(e) = self.store.insert_run(r) {
@@ -74,8 +82,55 @@ impl EventSink for AppSink {
     }
 }
 
+impl AppSink {
+    /// One OS notification per wait, gated by the persisted mute flag. The
+    /// notification plugin has no click events on desktop, so the amber tray
+    /// badge stays the way back in.
+    fn maybe_notify(&self, s: &UiSession) {
+        let mut notified = self.notified.lock().unwrap();
+        match s.session.status {
+            Status::Waiting => {
+                let Some(pending) = &s.pending else {
+                    return;
+                };
+                if !notified.insert(s.session.id.clone()) {
+                    return; // already notified for this wait
+                }
+                if self.store.muted() {
+                    return;
+                }
+                let (title, body) = match pending {
+                    Pending::Permission(p) => (
+                        "Agent needs approval",
+                        if p.command.is_empty() {
+                            p.tool.as_str()
+                        } else {
+                            p.command.as_str()
+                        },
+                    ),
+                    Pending::Input(q) => ("Agent is waiting for you", q.question.as_str()),
+                };
+                if let Err(e) = self
+                    .app
+                    .notification()
+                    .builder()
+                    .title(title)
+                    .body(body)
+                    .show()
+                {
+                    eprintln!("shepherd: notification failed: {e}");
+                }
+            }
+            _ => {
+                notified.remove(&s.session.id);
+            }
+        }
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             // menu-bar app: no dock icon
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -98,6 +153,7 @@ pub fn run() {
             let registry = Arc::new(shepherd_core::registry::Registry::new(Arc::new(AppSink {
                 app: app.handle().clone(),
                 store: store.clone(),
+                notified: Mutex::new(HashSet::new()),
             })));
             registry.set_muted(store.muted());
             if let Err(e) = store.recent_runs(200).map(|runs| registry.seed_runs(runs)) {
