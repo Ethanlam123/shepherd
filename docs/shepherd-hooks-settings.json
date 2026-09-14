@@ -16,6 +16,17 @@
     "  - matcher idle_prompt fires only for the ~60s idle 'waiting for input'",
     "    nudge; permission_prompt notifications are deliberately NOT intercepted",
     "    because PreToolUse already owns permission cards.",
+    "  - timeout 10: the nudge exchange must never wait on a user decision.",
+    "",
+    "Stop:",
+    "  - no matcher: Stop is not tool-scoped.",
+    "  - fires when the main agent finishes responding, i.e. once per turn;",
+    "    Shepherd records one run per turn from last_assistant_message",
+    "    (docs: prefer it over the transcript, which is not guaranteed to",
+    "    include the final message at Stop time on all versions).",
+    "  - the hook always exits 0 with no output: we never block the stop",
+    "    (stop_hook_active / the 8-consecutive-block override never apply).",
+    "  - timeout 10: same reasoning as Notification.",
     "",
     "Merge rules: entries whose command contains 'shepherd-hook' are ours.",
     "Install appends/refreshes them; uninstall removes exactly those entries.",
@@ -37,6 +48,17 @@
     "Notification": [
       {
         "matcher": "idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"<path-to-shepherd-hook>\" --sock \"<path-to-shepherd.sock>\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
         "hooks": [
           {
             "type": "command",

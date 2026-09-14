@@ -14,6 +14,9 @@
 //!   edited commands. Claude Code still enforces deny/ask rules on top of an
 //!   allow, so the user's deny rules are never bypassed.
 //! - Notification: forward the idle nudge to Shepherd and exit.
+//! - Stop: hand Shepherd the turn's `last_assistant_message` (docs: prefer
+//!   it over the transcript, which is not guaranteed flushed at Stop time)
+//!   and exit; we never block the stop.
 
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -45,6 +48,18 @@ fn run() -> i32 {
                     "type": "notification",
                     "sessionId": payload.get("session_id"),
                     "message": payload.get("message"),
+                }),
+            );
+            0
+        }
+        Some("Stop") => {
+            // turn complete: fire and forget, never block the stop
+            let _ = exchange(
+                &sock,
+                &json!({
+                    "type": "stop",
+                    "sessionId": payload.get("session_id"),
+                    "lastMessage": payload.get("last_assistant_message"),
                 }),
             );
             0

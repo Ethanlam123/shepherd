@@ -234,3 +234,22 @@ fn notification_forwards_and_exits() {
     assert_eq!(request["type"], "notification");
     assert_eq!(request["message"], "Claude is waiting for your input");
 }
+
+#[test]
+fn stop_forwards_last_message_and_exits() {
+    let env = Env::new();
+    let server = serve_once(&env.sock, json!({"decision": "ack"}));
+    let payload = json!({
+        "hook_event_name": "Stop",
+        "session_id": "11111111-2222-3333-4444-555555555555",
+        "cwd": "/tmp",
+        "stop_hook_active": false,
+        "last_assistant_message": "Done: fixed the hydration race.",
+    });
+    let (out, code) = env.run(&payload);
+    assert_eq!(code, Some(0));
+    assert_eq!(out, "", "stop hook never prints, never blocks");
+    let request = server.join().unwrap();
+    assert_eq!(request["type"], "stop");
+    assert_eq!(request["lastMessage"], "Done: fixed the hydration race.");
+}

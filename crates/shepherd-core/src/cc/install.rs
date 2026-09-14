@@ -10,6 +10,11 @@ use std::path::Path;
 /// Marker identifying our hook entries among the user's own.
 const MARKER: &str = "shepherd-hook";
 
+/// Timeout for the hook events that must never wait on a user decision
+/// (Notification nudge, Stop run-recording): long enough for the socket
+/// exchange, short enough that a wedged Shepherd never holds a turn.
+const FAST_HOOK_TIMEOUT: u64 = 10;
+
 /// The command line Claude Code runs: quoted absolute paths so spaces survive.
 pub fn hook_command(hook_bin: &Path, sock: &Path) -> String {
     format!("\"{}\" --sock \"{}\"", hook_bin.display(), sock.display())
@@ -22,7 +27,7 @@ pub fn installed(settings_path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Add or refresh our PreToolUse + Notification entries. Idempotent.
+/// Add or refresh our PreToolUse + Notification + Stop entries. Idempotent.
 pub fn install(settings_path: &Path, hook_bin: &Path, sock: &Path) -> Result<(), String> {
     install_with_timeout(settings_path, hook_bin, sock, 900)
 }
@@ -35,25 +40,34 @@ pub fn install_with_timeout(
 ) -> Result<(), String> {
     let mut root = read_settings(settings_path)?;
     let command = hook_command(hook_bin, sock);
-    let cmd = || {
+    let slow = || {
         json!({
             "type": "command",
             "command": command,
             "timeout": timeout_secs,
         })
     };
+    let fast = || {
+        json!({
+            "type": "command",
+            "command": command,
+            "timeout": FAST_HOOK_TIMEOUT,
+        })
+    };
     // PreToolUse: consequential tools only (decision 5)
     upsert_group(
         &mut root,
         "PreToolUse",
-        json!({"matcher": "Bash|Edit|Write|WebFetch|WebSearch", "hooks": [cmd()]}),
+        json!({"matcher": "Bash|Edit|Write|WebFetch|WebSearch", "hooks": [slow()]}),
     );
     // Notification: idle nudge only; permission_prompt is PreToolUse's job
     upsert_group(
         &mut root,
         "Notification",
-        json!({"matcher": "idle_prompt", "hooks": [cmd()]}),
+        json!({"matcher": "idle_prompt", "hooks": [fast()]}),
     );
+    // Stop: one run per completed turn; no matcher - Stop is not tool-scoped
+    upsert_group(&mut root, "Stop", json!({"hooks": [fast()]}));
     write_settings(settings_path, &root)
 }
 
@@ -61,7 +75,7 @@ pub fn install_with_timeout(
 pub fn uninstall(settings_path: &Path) -> Result<bool, String> {
     let mut root = read_settings(settings_path)?;
     let mut changed = false;
-    for event in ["PreToolUse", "Notification"] {
+    for event in ["PreToolUse", "Notification", "Stop"] {
         let Some(groups) = root
             .get_mut("hooks")
             .and_then(|h| h.get_mut(event))
@@ -148,7 +162,7 @@ fn is_ours(group: &Value) -> bool {
 }
 
 fn count_ours(root: &Value) -> usize {
-    ["PreToolUse", "Notification"]
+    ["PreToolUse", "Notification", "Stop"]
         .iter()
         .filter_map(|event| {
             root.pointer(&format!("/hooks/{event}"))
@@ -185,6 +199,16 @@ mod tests {
             v.pointer("/hooks/Notification/0/matcher").unwrap(),
             "idle_prompt"
         );
+        assert_eq!(
+            v.pointer("/hooks/Notification/0/hooks/0/timeout").unwrap(),
+            10,
+            "nudge must never wait on a user decision"
+        );
+        assert!(
+            v.pointer("/hooks/Stop/0").unwrap().get("matcher").is_none(),
+            "Stop is not tool-scoped"
+        );
+        assert_eq!(v.pointer("/hooks/Stop/0/hooks/0/timeout").unwrap(), 10);
         let cmd = v
             .pointer("/hooks/PreToolUse/0/hooks/0/command")
             .unwrap()
@@ -246,6 +270,11 @@ mod tests {
             v.pointer("/hooks/Stop/0/hooks/0/command").unwrap(),
             "say done"
         );
+        // our Stop group is appended beside the user's
+        assert_eq!(
+            v.pointer("/hooks/Stop").unwrap().as_array().unwrap().len(),
+            2
+        );
         assert_eq!(v.pointer("/permissions/allow/0").unwrap(), "Bash(echo:*)");
 
         // reinstall is idempotent, not duplicated
@@ -282,14 +311,17 @@ mod tests {
     "Notification": [
       {"matcher": "idle_prompt", "hooks": [{"type": "command", "command": "shepherd-hook --sock s"}]}
     ],
-    "Stop": [{"hooks": [{"type": "command", "command": "say done"}]}]
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "say done"}]},
+      {"hooks": [{"type": "command", "command": "shepherd-hook --sock s"}]}
+    ]
   }
 }"#,
         )
         .unwrap();
         assert!(uninstall(&p).unwrap());
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
-        // our two entries gone, user's PreToolUse + Stop kept, empty Notification dropped
+        // our three entries gone, user's PreToolUse + Stop kept, empty Notification dropped
         assert_eq!(
             v.pointer("/hooks/PreToolUse")
                 .unwrap()
@@ -303,6 +335,10 @@ mod tests {
             "guard.sh"
         );
         assert!(v.pointer("/hooks/Notification").is_none());
+        assert_eq!(
+            v.pointer("/hooks/Stop").unwrap().as_array().unwrap().len(),
+            1
+        );
         assert_eq!(
             v.pointer("/hooks/Stop/0/hooks/0/command").unwrap(),
             "say done"
