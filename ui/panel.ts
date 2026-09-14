@@ -88,6 +88,12 @@ const AGENTS: Record<string, { name: string; short: string; hue: string }> = {
   hm: { name: 'Hermes', short: 'HM', hue: 'var(--hm)' },
 };
 
+/** Agent metadata with a neutral fallback, so an unknown id (a new adapter,
+ * an old run from the db) renders instead of throwing. */
+function agentMeta(id: string): { name: string; short: string; hue: string } {
+  return AGENTS[id] ?? { name: id, short: id.slice(0, 2).toUpperCase(), hue: 'var(--muted)' };
+}
+
 /* ---------- state ---------- */
 
 const state = {
@@ -138,7 +144,7 @@ function fmtStarted(ts: number): string {
 }
 
 function badgeHtml(agentId: string): string {
-  const a = AGENTS[agentId];
+  const a = agentMeta(agentId);
   return '<span class="badge" style="--hue:' + a.hue + '" aria-hidden="true">' + a.short + '</span>';
 }
 
@@ -263,7 +269,7 @@ function htmlInbox(): string {
 }
 
 function cardHead(s: LocalSession, tagCls: string, tagText: string): string {
-  const a = AGENTS[s.agent];
+  const a = agentMeta(s.agent);
   return '<header class="od-row card-head">' +
     badgeHtml(s.agent) +
     '<span class="od-field od-fill">' +
@@ -392,7 +398,7 @@ function htmlSessions(): string {
       badgeHtml(s.agent) +
       '<span class="od-field od-fill">' +
       '<span class="c-title od-truncate">' + esc(s.title) + '</span>' +
-      '<span class="c-sub od-truncate">' + esc(AGENTS[s.agent].name + ' - ' + s.project + ' - started ' + fmtStarted(s.startedAt)) + '</span>' +
+      '<span class="c-sub od-truncate">' + esc(agentMeta(s.agent).name + ' - ' + s.project + ' - started ' + fmtStarted(s.startedAt)) + '</span>' +
       '</span>' +
       '<span class="s-side">' +
       statusChip(s) +
@@ -429,7 +435,7 @@ function htmlDetail(s: LocalSession): string {
     badgeHtml(s.agent) +
     '<span class="od-field od-fill">' +
     '<span class="c-title">' + esc(s.title) + '</span>' +
-    '<span class="c-sub">' + esc(AGENTS[s.agent].name + ' - ' + s.cwd) + '</span>' +
+    '<span class="c-sub">' + esc(agentMeta(s.agent).name + ' - ' + s.cwd) + '</span>' +
     '</span>' +
     '<span class="s-side">' + statusChip(s) +
     '<span class="elapsed od-nowrap" data-elapsed="' + s.id + '">' + fmtElapsed(s.elapsedMs) + '</span>' +
@@ -473,7 +479,7 @@ function htmlRuns(): string {
       badgeHtml(r.agent) +
       '<span class="od-field od-fill">' +
       '<span class="c-title od-truncate">' + esc(r.title) + '</span>' +
-      '<span class="c-sub od-truncate">' + esc(AGENTS[r.agent].name + ' - ' + (r.stopped ? 'stopped ' : 'finished ') + agoTxt) + '</span>' +
+      '<span class="c-sub od-truncate">' + esc(agentMeta(r.agent).name + ' - ' + (r.stopped ? 'stopped ' : 'finished ') + agoTxt) + '</span>' +
       '</span>' +
       '<span class="chev" aria-hidden="true"><svg><use href="#i-chev"/></svg></span>' +
       '</button>';
