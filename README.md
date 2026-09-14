@@ -94,7 +94,8 @@ Workspace layout:
 | `docs/shepherd-hooks-settings.json` | the exact settings contract we install |
 
 Checks: `cargo clippy --workspace --tests -- -D warnings && cargo test` and
-`npm run check`.
+`npm run check`. Warnings and errors are logged to
+`~/Library/Logs/Shepherd/shepherd.log`.
 
 ## Building a release
 

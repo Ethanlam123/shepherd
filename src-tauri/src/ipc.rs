@@ -36,7 +36,7 @@ pub fn send_control(state: State<Ipc>, session_id: String, control: Control) -> 
 pub fn set_muted(state: State<Ipc>, muted: bool) {
     state.registry.set_muted(muted);
     if let Err(e) = state.store.set_muted(muted) {
-        eprintln!("shepherd: persist mute failed: {e}");
+        log::warn!("persist mute failed: {e}");
     }
 }
 

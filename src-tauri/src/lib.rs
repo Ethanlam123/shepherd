@@ -41,24 +41,24 @@ struct RemovedPayload {
 
 impl EventSink for AppSink {
     fn emit(&self, event: UiEvent) {
-        // Persistence failures must not break the live panel; stderr keeps
-        // them visible for debugging.
+        // Persistence failures must not break the live panel; the log file
+        // keeps them visible for debugging.
         match &event {
             UiEvent::Session(s) => {
                 if let Err(e) = self.store.upsert_session(s) {
-                    eprintln!("shepherd: persist session failed: {e}");
+                    log::warn!("persist session failed: {e}");
                 }
                 self.maybe_notify(s);
             }
             UiEvent::Removed { session_id } => {
                 if let Err(e) = self.store.remove_session(session_id) {
-                    eprintln!("shepherd: remove session failed: {e}");
+                    log::warn!("remove session failed: {e}");
                 }
                 self.notified.lock().unwrap().remove(session_id);
             }
             UiEvent::Run(r) => {
                 if let Err(e) = self.store.insert_run(r) {
-                    eprintln!("shepherd: persist run failed: {e}");
+                    log::warn!("persist run failed: {e}");
                 }
             }
             _ => {}
@@ -119,7 +119,7 @@ impl AppSink {
                     .body(body)
                     .show()
                 {
-                    eprintln!("shepherd: notification failed: {e}");
+                    log::warn!("notification failed: {e}");
                 }
             }
             _ => {
@@ -145,11 +145,40 @@ fn hook_bin_path(dir: Option<&std::path::Path>) -> std::path::PathBuf {
 
 pub fn run() {
     tauri::Builder::default()
+        // must be first: a second launch hands off to the running instance
+        // and exits instead of stealing its hook socket
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tray::show_panel(app);
+        }))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // menu-bar app: no dock icon
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            // warnings and errors land in ~/Library/Logs/Shepherd/shepherd.log;
+            // stderr stays live for dev runs
+            let log_dir = app
+                .path()
+                .home_dir()
+                .map(|home| home.join("Library/Logs/Shepherd"))
+                .map_err(|e| format!("resolve home dir: {e}"))?;
+            app.handle().plugin(
+                tauri_plugin_log::Builder::new()
+                    .level(if cfg!(debug_assertions) {
+                        log::LevelFilter::Debug
+                    } else {
+                        log::LevelFilter::Info
+                    })
+                    .targets([
+                        tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Folder {
+                            path: log_dir,
+                            file_name: Some("shepherd".into()),
+                        }),
+                        tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                    ])
+                    .build(),
+            )?;
 
             let panel = app.get_webview_window("panel").expect("panel window");
             apply_vibrancy(&panel, NSVisualEffectMaterial::Sidebar, None, None)
@@ -176,7 +205,7 @@ pub fn run() {
             })));
             registry.set_muted(store.muted());
             if let Err(e) = store.recent_runs(200).map(|runs| registry.seed_runs(runs)) {
-                eprintln!("shepherd: load runs failed: {e}");
+                log::warn!("load runs failed: {e}");
             }
 
             // real Claude Code sessions always; mock demo agents on demand

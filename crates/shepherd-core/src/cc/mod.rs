@@ -240,7 +240,7 @@ impl AgentAdapter for CcAdapter {
                 Ok(listener) => {
                     tokio::spawn(server::serve(listener, hook_tx));
                 }
-                Err(e) => eprintln!("shepherd: hook socket unavailable: {e}"),
+                Err(e) => log::error!("hook socket unavailable: {e}"),
             }
 
             let mut tick = interval(Duration::from_secs(1));

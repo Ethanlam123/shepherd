@@ -57,7 +57,7 @@ pub fn toggle(app: &AppHandle) {
     }
 }
 
-fn show_panel(app: &AppHandle) {
+pub(crate) fn show_panel(app: &AppHandle) {
     let Some(win) = app.get_webview_window("panel") else {
         return;
     };

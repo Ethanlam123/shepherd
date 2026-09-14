@@ -9,6 +9,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "sync", "net", "io-util"] }
 home = "0.5"
 libc = "0.2"
+log = "0.4"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [dev-dependencies]
