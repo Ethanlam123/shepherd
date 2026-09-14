@@ -5,11 +5,35 @@
 //! UI-visible state. Adapters never talk to the UI directly.
 
 pub mod config;
-pub mod mock;
 pub mod registry;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+
+/// Current time in epoch ms.
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// A finished run, as stored and shown on the Runs tab.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Run {
+    pub id: String,
+    pub agent: String,
+    pub title: String,
+    pub project: String,
+    /// Epoch ms.
+    pub ended_at: i64,
+    pub duration_ms: u64,
+    pub tokens: u64,
+    pub stopped: bool,
+    pub outcome: String,
+    pub files: Vec<String>,
+}
 
 /// Live status of a session. Waiting always pairs with a `Pending` in the
 /// registry; the tray badge counts waiting sessions.
