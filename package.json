@@ -5,7 +5,9 @@
     "build:ui": "esbuild ui/panel.ts --bundle --format=esm --outfile=ui/dist/panel.js",
     "check": "tsc --noEmit",
     "dev": "tauri dev",
-    "build": "tauri build"
+    "build": "tauri build",
+    "sidecar": "./scripts/sidecar.sh",
+    "release": "./scripts/release.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2"

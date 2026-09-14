@@ -3,3 +3,4 @@ target/
 ui/dist/
 src-tauri/gen/
 .claude/settings.local.json
+src-tauri/binaries/
